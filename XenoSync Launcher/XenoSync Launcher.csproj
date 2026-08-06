@@ -1,0 +1,22 @@
+﻿
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>WinExe</OutputType>
+		<TargetFramework>net8.0-windows</TargetFramework>
+		<UseWPF>true</UseWPF>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<RootNamespace>XenoSyncLauncher</RootNamespace>
+		<AssemblyName>XenoSyncLauncher</AssemblyName>
+		<ApplicationIcon></ApplicationIcon>
+		<LangVersion>latest</LangVersion>
+	</PropertyGroup>
+
+	<ItemGroup>
+	  <PackageReference Include="QRCoder" Version="1.6.0" />
+	  <PackageReference Include="QRCoder.Xaml" Version="1.6.0" />
+	  <PackageReference Include="SharpCompress" Version="0.37.2" />
+	</ItemGroup>
+
+</Project>

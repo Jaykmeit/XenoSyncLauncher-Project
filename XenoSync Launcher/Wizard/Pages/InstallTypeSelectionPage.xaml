@@ -1,0 +1,33 @@
+<Page x:Class="XenoSyncLauncher.Wizard.Pages.InstallTypeSelectionPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      Background="{StaticResource BrushBackground}">
+    <StackPanel Margin="50,40,50,0">
+        <TextBlock Text="Installation Method"
+                   Foreground="{StaticResource BrushTextPrimary}"
+                   FontSize="24" FontWeight="Bold" Margin="0,0,0,8"/>
+        <TextBlock Foreground="{StaticResource BrushTextSecondary}"
+                   FontSize="13" TextWrapping="Wrap" Margin="0,0,0,25">
+            Choose how you would like to install Xenoverse 2 Modded.
+        </TextBlock>
+
+        <RadioButton x:Name="OverVanillaRadio" GroupName="InstallType"
+                     Checked="OptionChanged" Margin="0,0,0,4">
+            <TextBlock Text="Install over Xenoverse 2 Vanilla" Foreground="{StaticResource BrushTextPrimary}" FontSize="15" FontWeight="SemiBold"/>
+        </RadioButton>
+        <TextBlock Foreground="{StaticResource BrushTextSecondary}" FontSize="12" TextWrapping="Wrap"
+                    Margin="24,0,0,20">
+            Your current Vanilla folder will turn into Modded folder. Recommended only if you wish to have one Xenoverse 2 location with the downside of not being able to play Online in Vanilla Lobbies.
+        </TextBlock>
+
+        <RadioButton x:Name="SeparateDirectoryRadio" GroupName="InstallType"
+                     Checked="OptionChanged" Margin="0,0,0,4">
+            <TextBlock Text="Install Xenoverse 2 Modded in a different path" Foreground="{StaticResource BrushTextPrimary}" FontSize="15" FontWeight="SemiBold"/>
+        </RadioButton>
+        <TextBlock Foreground="{StaticResource BrushTextSecondary}" FontSize="12" TextWrapping="Wrap"
+                    Margin="24,0,0,0">
+            Keeps your Xenoverse 2 Vanilla path untouched and sets a different installation elsewhere. It may create a copy of it in the Modded path.
+            Very recommended if you wish to play Vanilla while enjoying the Revamp experience simultaneously.
+        </TextBlock>
+    </StackPanel>
+</Page>

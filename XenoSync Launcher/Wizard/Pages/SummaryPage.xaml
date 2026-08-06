@@ -1,0 +1,30 @@
+<Page x:Class="XenoSyncLauncher.Wizard.Pages.SummaryPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      Background="{StaticResource BrushBackground}">
+    <StackPanel Margin="50,40,50,0">
+        <TextBlock Text="Ready to install"
+                   Foreground="{StaticResource BrushTextPrimary}"
+                   FontSize="24" FontWeight="Bold" Margin="0,0,0,10"/>
+        <TextBlock Foreground="{StaticResource BrushTextSecondary}"
+                   FontSize="13" TextWrapping="Wrap" Margin="0,0,0,20">
+            This is a summary of what XenoSync Launcher is about to do. Click "Finish" to apply
+            these changes and open the main launcher window.
+        </TextBlock>
+
+        <Border Background="{StaticResource BrushPanel}" BorderBrush="{StaticResource BrushBorder}"
+                BorderThickness="1" CornerRadius="4" Padding="18">
+            <StackPanel>
+                <TextBlock x:Name="InstallTypeText" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" Margin="0,0,0,8"/>
+                <TextBlock x:Name="ModdedPathText" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" Margin="0,0,0,8"/>
+                <TextBlock x:Name="VanillaPathText" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" Margin="0,0,0,8"/>
+                <TextBlock x:Name="ActionText" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" TextWrapping="Wrap"/>
+            </StackPanel>
+        </Border>
+
+        <CheckBox x:Name="CopyVanillaCheckBox" Content="Copy the Vanilla installation into the Modded folder now"
+                  Foreground="{StaticResource BrushTextPrimary}" FontSize="13" Margin="0,15,0,0"
+                  Visibility="Collapsed" Checked="CopyVanillaCheckBox_Changed" Unchecked="CopyVanillaCheckBox_Changed"/>
+        <TextBlock x:Name="CopyProgressText" Foreground="{StaticResource BrushTextSecondary}" FontSize="12" Margin="0,6,0,0" Visibility="Collapsed"/>
+    </StackPanel>
+</Page>

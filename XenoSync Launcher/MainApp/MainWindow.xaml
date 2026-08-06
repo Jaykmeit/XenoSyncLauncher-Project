@@ -1,0 +1,203 @@
+<Window x:Class="XenoSyncLauncher.MainApp.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:XenoSyncLauncher.MainApp"
+        Title="XenoSync Launcher"
+        Height="680" Width="980"
+        WindowStartupLocation="CenterScreen"
+        Background="{StaticResource BrushBackground}">
+    <Grid Margin="0">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="56"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="150"/>
+            <RowDefinition Height="70"/>
+        </Grid.RowDefinitions>
+
+        <!-- Top bar: title, Live/Not Found indicator, Settings gear -->
+        <Border Grid.Row="0" Background="{StaticResource BrushPanel}" BorderBrush="{StaticResource BrushBorder}" BorderThickness="0,0,0,1">
+            <Grid Margin="20,0">
+                <TextBlock Text="XenoSync Launcher" Foreground="{StaticResource BrushTextPrimary}"
+                           FontSize="18" FontWeight="Bold" VerticalAlignment="Center"/>
+
+                <Border x:Name="LiveIndicatorBadge" HorizontalAlignment="Center" VerticalAlignment="Center"
+                        Background="{StaticResource BrushPanel}" BorderBrush="{StaticResource BrushBorder}"
+                        BorderThickness="1" CornerRadius="12" Padding="12,4">
+                    <StackPanel Orientation="Horizontal">
+                        <Ellipse x:Name="LiveIndicatorDot" Width="8" Height="8" Fill="{StaticResource BrushDanger}" Margin="0,0,8,0"/>
+                        <TextBlock x:Name="LiveIndicatorText" Text="Not Found" Foreground="{StaticResource BrushTextPrimary}" FontSize="12" FontWeight="SemiBold"/>
+                    </StackPanel>
+                </Border>
+
+                <Button x:Name="SettingsButton" Content="&#9881;" Width="36" Height="36"
+                        HorizontalAlignment="Right" FontSize="16"
+                        Style="{StaticResource WizardButton}" Click="SettingsButton_Click"
+                        ToolTip="Settings"/>
+            </Grid>
+        </Border>
+
+        <!-- Main content: mod tree + details / Launch Inspect sidebar -->
+        <Grid Grid.Row="1" Margin="20,15,20,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="2*"/>
+                <ColumnDefinition Width="15"/>
+                <ColumnDefinition Width="1*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Mod tree -->
+            <Border Grid.Column="0" Background="{StaticResource BrushPanel}" BorderBrush="{StaticResource BrushBorder}" BorderThickness="1" CornerRadius="4">
+                <Grid Margin="12">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    <TextBlock Grid.Row="0" Text="Installed Mods" Foreground="{StaticResource BrushTextPrimary}"
+                           FontSize="14" FontWeight="SemiBold" Margin="0,0,0,10"/>
+                    <ListBox x:Name="ModListBox" Grid.Row="1" Background="Transparent" BorderThickness="0"
+                             SelectionChanged="ModListBox_SelectionChanged">
+                        <ListBox.GroupStyle>
+                            <GroupStyle>
+                                <GroupStyle.HeaderTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Name}" Foreground="{StaticResource BrushAccent}"
+                                                   FontWeight="Bold" FontSize="12" Margin="0,12,0,4"/>
+                                    </DataTemplate>
+                                </GroupStyle.HeaderTemplate>
+                            </GroupStyle>
+                        </ListBox.GroupStyle>
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Grid Margin="0,4">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <CheckBox Grid.Column="0" IsChecked="{Binding IsChecked, Mode=TwoWay}"
+                                              IsEnabled="{Binding IsCheckboxEnabled}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                        <TextBlock Text="{Binding Title}" Foreground="{StaticResource BrushTextPrimary}"
+                                                   FontSize="13" Cursor="Hand"/>
+                                        <TextBlock Text="{Binding ParentTitle, StringFormat='Requires: {0}'}"
+                                                   Foreground="{StaticResource BrushTextSecondary}" FontSize="10" FontStyle="Italic"
+                                                   Visibility="{Binding ParentTitle, Converter={x:Static local:NullToVisibilityConverter.Instance}}"/>
+                                    </StackPanel>
+                                </Grid>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </Grid>
+            </Border>
+
+            <!-- Sidebar: mod details + Launch Inspect -->
+            <StackPanel Grid.Column="2">
+                <Border Background="{StaticResource BrushPanel}" BorderBrush="{StaticResource BrushBorder}" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,0,0,15">
+                    <StackPanel>
+                        <TextBlock Text="Mod Details" Foreground="{StaticResource BrushTextPrimary}" FontSize="14" FontWeight="SemiBold" Margin="0,0,0,8"/>
+                        <TextBlock x:Name="ModDetailTitle" Text="Select a mod" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,6"/>
+                        <TextBlock x:Name="ModDetailDescription" Text="" Foreground="{StaticResource BrushTextSecondary}" FontSize="12" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                        <Button x:Name="VisitModPageButton" Content="View mod page" Style="{StaticResource WizardButton}"
+                                HorizontalAlignment="Left" Click="VisitModPageButton_Click" IsEnabled="False"/>
+                    </StackPanel>
+                </Border>
+
+                <Border Background="{StaticResource BrushPanel}" BorderBrush="{StaticResource BrushBorder}" BorderThickness="1" CornerRadius="4" Padding="12">
+                    <StackPanel>
+                        <TextBlock Text="Launch Inspect" Foreground="{StaticResource BrushTextPrimary}" FontSize="14" FontWeight="SemiBold" Margin="0,0,0,10"/>
+
+                        <TextBlock Text="Revamp" Foreground="{StaticResource BrushTextSecondary}" FontSize="11" Margin="0,0,0,2"/>
+                        <Grid Margin="0,0,0,10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="Installed" Foreground="{StaticResource BrushTextSecondary}" FontSize="10"/>
+                                <TextBlock x:Name="RevampInstalledText" Text="-" Foreground="{StaticResource BrushTextPrimary}" FontSize="13"/>
+                            </StackPanel>
+                            <StackPanel Grid.Column="1">
+                                <TextBlock Text="Latest" Foreground="{StaticResource BrushTextSecondary}" FontSize="10"/>
+                                <TextBlock x:Name="RevampLatestText" Text="-" Foreground="{StaticResource BrushTextPrimary}" FontSize="13"/>
+                            </StackPanel>
+                        </Grid>
+
+                        <TextBlock Text="XV2Patcher" Foreground="{StaticResource BrushTextSecondary}" FontSize="11" Margin="0,0,0,2"/>
+                        <Grid Margin="0,0,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="Installed" Foreground="{StaticResource BrushTextSecondary}" FontSize="10"/>
+                                <TextBlock x:Name="PatcherInstalledText" Text="-" Foreground="{StaticResource BrushTextPrimary}" FontSize="13"/>
+                            </StackPanel>
+                            <StackPanel Grid.Column="1">
+                                <TextBlock Text="Latest" Foreground="{StaticResource BrushTextSecondary}" FontSize="10"/>
+                                <TextBlock x:Name="PatcherLatestText" Text="-" Foreground="{StaticResource BrushTextPrimary}" FontSize="13"/>
+                            </StackPanel>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </Grid>
+
+        <!-- Log console -->
+        <Border Grid.Row="2" Margin="20,0,20,10" Background="#14151A" BorderBrush="{StaticResource BrushBorder}" BorderThickness="1" CornerRadius="4">
+            <Grid Margin="10">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <Grid Grid.Row="0" Margin="0,0,0,4">
+                    <TextBlock Text="Log" Foreground="{StaticResource BrushTextSecondary}" FontSize="11" VerticalAlignment="Center"/>
+                    <Button x:Name="CopyLogButton" Content="Copy Log" Width="80" Height="22" Padding="0" FontSize="10"
+                            HorizontalAlignment="Right" Style="{StaticResource WizardButton}" Click="CopyLogButton_Click"/>
+                </Grid>
+                <ListBox x:Name="LogListBox" Grid.Row="1" Background="Transparent" BorderThickness="0"
+                         FontFamily="Consolas" FontSize="11">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding Text}" Foreground="{Binding ForegroundBrush}" TextWrapping="Wrap"/>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </Grid>
+        </Border>
+
+        <!-- Bottom action bar: Update/Pause/Resume + Run -->
+        <Border Grid.Row="3" Background="{StaticResource BrushPanel}" BorderBrush="{StaticResource BrushBorder}" BorderThickness="0,1,0,0">
+            <Grid Margin="20,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <Grid Grid.Column="0" Margin="0,10,20,0" VerticalAlignment="Top">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <Grid x:Name="UpdateStatusPanel" Grid.Row="0" Visibility="Collapsed" Margin="0,0,0,4">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock x:Name="UpdateTaskText" Grid.Column="0" Text="Downloading..."
+                                   Foreground="{StaticResource BrushTextSecondary}" FontSize="11"/>
+                        <TextBlock x:Name="UpdatePercentText" Grid.Column="1" Text="0%"
+                                   Foreground="{StaticResource BrushTextPrimary}" FontSize="11" FontWeight="SemiBold"/>
+                    </Grid>
+                    <ProgressBar x:Name="UpdateProgressBar" Grid.Row="1" Height="6" Visibility="Collapsed"/>
+                </Grid>
+
+                <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <Button x:Name="UpdateButton" Content="Update" Width="110" Height="25" Margin="0,0,10,0"
+                            Style="{StaticResource WizardButton}" Click="UpdateButton_Click"/>
+                    <Button x:Name="PauseResumeButton" Content="Pause" Width="110" Height="25" Margin="0,0,10,0"
+                            Style="{StaticResource WizardButton}" Click="PauseResumeButton_Click" Visibility="Collapsed"/>
+                    <Button x:Name="RunButton" Content="Run" Width="110" Height="25"
+                            Style="{StaticResource RunButton}" Click="RunButton_Click" IsEnabled="False"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

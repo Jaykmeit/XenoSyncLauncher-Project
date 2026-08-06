@@ -1,0 +1,38 @@
+<Page x:Class="XenoSyncLauncher.Wizard.Pages.EvaluationPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      Background="{StaticResource BrushBackground}">
+    <StackPanel Margin="50,40,50,0">
+        <TextBlock Text="Evaluating your installation"
+                   Foreground="{StaticResource BrushTextPrimary}"
+                   FontSize="24" FontWeight="Bold" Margin="0,0,0,10"/>
+        <TextBlock x:Name="StatusText"
+                   Text="Checking versions..."
+                   Foreground="{StaticResource BrushTextSecondary}"
+                   FontSize="13" TextWrapping="Wrap" Margin="0,0,0,20"/>
+
+        <ProgressBar x:Name="ProgressIndicator" Height="6" IsIndeterminate="True" Margin="0,0,0,30"/>
+
+        <Grid x:Name="VersionDetailsGrid" Visibility="Collapsed">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Row="0" Grid.Column="0" Text="Installed Vanilla version:" Foreground="{StaticResource BrushTextSecondary}" FontSize="13" Margin="0,4"/>
+            <TextBlock x:Name="VanillaVersionText" Grid.Row="0" Grid.Column="1" Text="-" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" Margin="0,4"/>
+
+            <TextBlock Grid.Row="1" Grid.Column="0" Text="Revamp-supported version:" Foreground="{StaticResource BrushTextSecondary}" FontSize="13" Margin="0,4"/>
+            <TextBlock x:Name="RevampVersionText" Grid.Row="1" Grid.Column="1" Text="-" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" Margin="0,4"/>
+        </Grid>
+
+        <Border x:Name="ResultBanner" Background="{StaticResource BrushPanel}" BorderBrush="{StaticResource BrushBorder}"
+                BorderThickness="1" CornerRadius="4" Padding="15" Margin="0,25,0,0" Visibility="Collapsed">
+            <TextBlock x:Name="ResultText" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" TextWrapping="Wrap"/>
+        </Border>
+    </StackPanel>
+</Page>

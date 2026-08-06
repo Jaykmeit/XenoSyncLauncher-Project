@@ -1,0 +1,40 @@
+<Window x:Class="XenoSyncLauncher.Wizard.WizardWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="XenoSync Launcher - First Run Setup"
+        Height="560" Width="820"
+        WindowStartupLocation="CenterScreen"
+        Background="{StaticResource BrushBackground}"
+        ResizeMode="NoResize">
+    <Grid Margin="0">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="64"/>
+        </Grid.RowDefinitions>
+
+        <!-- Contenedor de las páginas del wizard -->
+        <Frame x:Name="WizardFrame"
+               Grid.Row="0"
+               NavigationUIVisibility="Hidden"
+               JournalOwnership="OwnsJournal"/>
+
+        <!-- Barra inferior de navegación -->
+        <Border Grid.Row="1" Background="{StaticResource BrushPanel}" BorderBrush="{StaticResource BrushBorder}" BorderThickness="0,1,0,0">
+            <Grid Margin="20,0">
+                <TextBlock x:Name="StepIndicatorText"
+                           Text="Step 1 of 5"
+                           Foreground="{StaticResource BrushTextSecondary}"
+                           VerticalAlignment="Center"
+                           FontSize="12"/>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <Button x:Name="CancelButton" Content="Cancel" Width="100" Height="25" Margin="0,0,10,0"
+                            Style="{StaticResource WizardButton}" Click="CancelButton_Click"/>
+                    <Button x:Name="BackButton" Content="Back" Width="100" Margin="0,0,10,0"
+                            Style="{StaticResource WizardButton}" Click="BackButton_Click"/>
+                    <Button x:Name="NextButton" Content="Next" Width="120"
+                            Style="{StaticResource PrimaryButton}" Click="NextButton_Click"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
