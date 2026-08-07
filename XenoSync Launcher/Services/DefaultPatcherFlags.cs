@@ -16,7 +16,7 @@ public static class DefaultPatcherFlags
 
     public static void ApplyTo(string moddedPath, IniFlagService iniFlagService)
     {
-        var iniPath = Path.Combine(moddedPath, "XV2PATCHER", "xv2patcher.ini");
+        var iniPath = Path.Combine(moddedPath, "xv2patcher.ini");
         if (!File.Exists(iniPath)) return;
 
         var lines = iniFlagService.ReadLines(iniPath);

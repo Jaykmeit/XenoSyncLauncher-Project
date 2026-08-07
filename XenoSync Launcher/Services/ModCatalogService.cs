@@ -50,9 +50,17 @@ public class ModCatalogService
             BuildRevampCoreEntry(localById, moddedPath)
         };
 
+        var seenIds = new HashSet<string>();
+
         foreach (var remote in remoteMods)
         {
             if (string.IsNullOrWhiteSpace(remote.Id)) continue;
+
+            // The hosted catalog is hand-edited; guard against a duplicated id
+            // (copy-paste mistake) instead of letting it crash mod loading later
+            // in ReorderChildrenAfterParents/ToDictionary.
+            if (!seenIds.Add(remote.Id))
+                continue;
 
             var category = remote.Category == "XenoSyncCore" ? ModCategory.XenoSyncCore : ModCategory.Optional;
             localById.TryGetValue(remote.Id, out var existing);
@@ -76,8 +84,10 @@ public class ModCatalogService
                 Id = remote.Id,
                 Title = remote.Title ?? remote.Id,
                 Description = remote.Description ?? string.Empty,
+                Author = remote.Author ?? string.Empty,
                 PageUrl = remote.PageUrl ?? string.Empty,
                 DownloadUrls = downloadUrls,
+                ScreenshotUrls = remote.ScreenshotUrls ?? new List<string>(),
                 ParentId = remote.Parent,
                 Category = category,
                 IsEnabled = isActuallyInstalled,
@@ -135,6 +145,7 @@ public class ModCatalogService
             Id = "xv2-revamp-core",
             Title = "Xenoverse 2 Revamp",
             Description = "Core mod pack bundled with the Revamp installer. Always required by XenoSync Launcher.",
+            Author = "Project Revamp Team",
             PageUrl = "https://www.revampxv2.com/download",
             Category = ModCategory.RevampCore,
             IsEnabled = isActuallyInstalled,

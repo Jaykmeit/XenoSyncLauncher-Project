@@ -2,10 +2,14 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:XenoSyncLauncher.MainApp"
+        xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
         Title="XenoSync Launcher"
-        Height="680" Width="980"
+        Height="680" Width="1320"
         WindowStartupLocation="CenterScreen"
         Background="{StaticResource BrushBackground}">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis"/>
+    </Window.Resources>
     <Grid Margin="0">
         <Grid.RowDefinitions>
             <RowDefinition Height="56"/>
@@ -41,6 +45,8 @@
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="2*"/>
                 <ColumnDefinition Width="15"/>
+                <ColumnDefinition Width="2*"/>
+                <ColumnDefinition Width="15"/>
                 <ColumnDefinition Width="1*"/>
             </Grid.ColumnDefinitions>
 
@@ -67,20 +73,39 @@
                         </ListBox.GroupStyle>
                         <ListBox.ItemTemplate>
                             <DataTemplate>
-                                <Grid Margin="0,4">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto"/>
-                                        <ColumnDefinition Width="*"/>
-                                    </Grid.ColumnDefinitions>
-                                    <CheckBox Grid.Column="0" IsChecked="{Binding IsChecked, Mode=TwoWay}"
-                                              IsEnabled="{Binding IsCheckboxEnabled}" VerticalAlignment="Center" Margin="0,0,10,0"/>
-                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                                        <TextBlock Text="{Binding Title}" Foreground="{StaticResource BrushTextPrimary}"
-                                                   FontSize="13" Cursor="Hand"/>
-                                        <TextBlock Text="{Binding ParentTitle, StringFormat='Requires: {0}'}"
-                                                   Foreground="{StaticResource BrushTextSecondary}" FontSize="10" FontStyle="Italic"
-                                                   Visibility="{Binding ParentTitle, Converter={x:Static local:NullToVisibilityConverter.Instance}}"/>
-                                    </StackPanel>
+                                <Grid Margin="{Binding IndentLevel, Converter={x:Static local:IndentLevelToMarginConverter.Instance}}"
+                                      Visibility="{Binding IsVisibleInTree, Converter={StaticResource BoolToVis}}">
+                                    <Grid Margin="0,4">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="16"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Grid.Column="0" Text="{Binding IsExpanded, Converter={x:Static local:BoolToArrowConverter.Instance}}"
+                                                   Foreground="{StaticResource BrushTextSecondary}" FontSize="9" Cursor="Hand"
+                                                   VerticalAlignment="Center" MouseLeftButtonUp="ExpandToggle_Click"
+                                                   Visibility="{Binding HasChildren, Converter={StaticResource BoolToVis}}"/>
+                                        <CheckBox Grid.Column="1" IsChecked="{Binding IsChecked, Mode=TwoWay}"
+                                                  IsEnabled="{Binding IsCheckboxEnabled}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                                        <StackPanel Grid.Column="2" VerticalAlignment="Center">
+                                            <TextBlock Text="{Binding Title}" Foreground="{StaticResource BrushTextPrimary}"
+                                                       FontSize="13" Cursor="Hand"
+                                                       MouseEnter="ModTitle_MouseEnter" MouseLeave="ModTitle_MouseLeave"/>
+                                            <TextBlock Text="{Binding ParentTitle, StringFormat='Requires: {0}'}"
+                                                       Foreground="{StaticResource BrushTextSecondary}" FontSize="10" FontStyle="Italic"
+                                                       Visibility="{Binding ParentTitle, Converter={x:Static local:NullToVisibilityConverter.Instance}}"/>
+                                            <Grid Visibility="{Binding IsDownloading, Converter={StaticResource BoolToVis}}" Margin="0,4,0,0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <ProgressBar Grid.Column="0" Height="4" Minimum="0" Maximum="100"
+                                                             Value="{Binding DownloadPercent, Mode=OneWay}" VerticalAlignment="Center"/>
+                                                <TextBlock Grid.Column="1" Text="{Binding DownloadPercent, StringFormat='{}{0:0}%'}"
+                                                           Foreground="{StaticResource BrushTextSecondary}" FontSize="9" Margin="6,0,0,0"/>
+                                            </Grid>
+                                        </StackPanel>
+                                    </Grid>
                                 </Grid>
                             </DataTemplate>
                         </ListBox.ItemTemplate>
@@ -88,12 +113,43 @@
                 </Grid>
             </Border>
 
+            <!-- Mod page preview: persistent panel (not a hover popup) showing the
+                 selected mod's real page via WebView2. Kept out of any Popup - WebView2
+                 doesn't compose reliably inside a transparent/layered Popup (it can pop
+                 out as its own OS-chrome window), so it lives in the normal layout instead. -->
+            <Border Grid.Column="2" Background="{StaticResource BrushPanel}" BorderBrush="{StaticResource BrushBorder}" BorderThickness="1" CornerRadius="4">
+                <Grid Margin="12">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <StackPanel Grid.Row="0" Margin="0,0,0,8">
+                        <TextBlock Text="Mod Page Preview" Foreground="{StaticResource BrushTextPrimary}" FontSize="14" FontWeight="SemiBold"/>
+                        <TextBlock x:Name="ModPagePreviewAuthorText" Text="" Foreground="{StaticResource BrushTextSecondary}"
+                                   FontSize="11" FontStyle="Italic" Margin="0,2,0,0"
+                                   Visibility="Collapsed"/>
+                    </StackPanel>
+
+                    <Grid Grid.Row="1">
+                        <TextBlock x:Name="ModPagePreviewEmptyText" Text="Select a mod to preview its page here."
+                                   Foreground="{StaticResource BrushTextSecondary}" FontSize="12"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="ModPagePreviewFallbackText" FontSize="12" TextWrapping="Wrap" Margin="14"
+                                   Foreground="{StaticResource BrushTextSecondary}" Visibility="Collapsed"
+                                   Text="Couldn't load a live preview (the WebView2 Runtime may not be installed). Use 'View mod page' to open it in your browser instead."/>
+                        <wv2:WebView2 x:Name="ModPagePreviewWebView" Visibility="Collapsed"/>
+                    </Grid>
+                </Grid>
+            </Border>
+
             <!-- Sidebar: mod details + Launch Inspect -->
-            <StackPanel Grid.Column="2">
+            <StackPanel Grid.Column="4">
                 <Border Background="{StaticResource BrushPanel}" BorderBrush="{StaticResource BrushBorder}" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,0,0,15">
                     <StackPanel>
                         <TextBlock Text="Mod Details" Foreground="{StaticResource BrushTextPrimary}" FontSize="14" FontWeight="SemiBold" Margin="0,0,0,8"/>
-                        <TextBlock x:Name="ModDetailTitle" Text="Select a mod" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,6"/>
+                        <TextBlock x:Name="ModDetailTitle" Text="Select a mod" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,2"/>
+                        <TextBlock x:Name="ModDetailAuthorText" Text="" Foreground="{StaticResource BrushTextSecondary}" FontSize="11" FontStyle="Italic" Margin="0,0,0,6" Visibility="Collapsed"/>
                         <TextBlock x:Name="ModDetailDescription" Text="" Foreground="{StaticResource BrushTextSecondary}" FontSize="12" TextWrapping="Wrap" Margin="0,0,0,10"/>
                         <Button x:Name="VisitModPageButton" Content="View mod page" Style="{StaticResource WizardButton}"
                                 HorizontalAlignment="Left" Click="VisitModPageButton_Click" IsEnabled="False"/>
@@ -199,5 +255,42 @@
                 </StackPanel>
             </Grid>
         </Border>
+
+        <!-- Mod hover "bocadillo": a lightweight, chromeless summary next to the
+             cursor - title, author credit, description, and a small auto-cycling
+             slideshow of curated screenshots. Deliberately has no embedded WebView2
+             (that lives in the persistent Mod Page Preview panel instead), which is
+             also why hovering it never has the airspace/close issue a windowed
+             control inside a transparent Popup would cause. -->
+        <Popup x:Name="ModPreviewPopup" AllowsTransparency="True" StaysOpen="True" Placement="Mouse"
+               HorizontalOffset="18" VerticalOffset="18" Width="300"
+               MouseEnter="ModPreviewPopup_MouseEnter" MouseLeave="ModPreviewPopup_MouseLeave">
+            <Border Background="{StaticResource BrushPanel}" BorderBrush="{StaticResource BrushBorder}"
+                    BorderThickness="1" CornerRadius="8" RenderTransformOrigin="0,0.5">
+                <Border.RenderTransform>
+                    <ScaleTransform x:Name="ModPreviewScaleTransform" ScaleX="0.85" ScaleY="0.85"/>
+                </Border.RenderTransform>
+                <Border.Effect>
+                    <DropShadowEffect BlurRadius="20" ShadowDepth="4" Opacity="0.45" Color="Black"/>
+                </Border.Effect>
+                <StackPanel Margin="12">
+                    <Border Height="150" Background="{StaticResource BrushBackground}" CornerRadius="5" Margin="0,0,0,8" ClipToBounds="True">
+                        <Grid>
+                            <Image x:Name="ModPreviewSlideshowImageA" Stretch="UniformToFill" Opacity="1"/>
+                            <Image x:Name="ModPreviewSlideshowImageB" Stretch="UniformToFill" Opacity="0"/>
+                            <TextBlock x:Name="ModPreviewNoScreenshotsText" Text="No screenshots available"
+                                       Foreground="{StaticResource BrushTextSecondary}" FontSize="11"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Collapsed"/>
+                        </Grid>
+                    </Border>
+                    <TextBlock x:Name="ModPreviewTitleText" Foreground="{StaticResource BrushTextPrimary}"
+                               FontSize="13" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,2"/>
+                    <TextBlock x:Name="ModPreviewAuthorText" Foreground="{StaticResource BrushTextSecondary}"
+                               FontSize="10" FontStyle="Italic" Margin="0,0,0,6" Visibility="Collapsed"/>
+                    <TextBlock x:Name="ModPreviewDescriptionText" Foreground="{StaticResource BrushTextSecondary}"
+                               FontSize="11" TextWrapping="Wrap" MaxHeight="70" TextTrimming="CharacterEllipsis"/>
+                </StackPanel>
+            </Border>
+        </Popup>
     </Grid>
 </Window>

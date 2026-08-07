@@ -56,17 +56,27 @@ public class ModInstallService
             for (int i = 0; i < mod.DownloadUrls.Count; i++)
             {
                 var url = mod.DownloadUrls[i];
-                var fileName = GetFileNameFromUrl(url) ?? $"part{i + 1}";
-                var partPath = Path.Combine(partsDir, fileName);
 
                 if (mod.DownloadUrls.Count > 1)
-                    onStatus?.Invoke($"Downloading part {i + 1} of {mod.DownloadUrls.Count} ({fileName})...");
+                    onStatus?.Invoke($"Downloading part {i + 1} of {mod.DownloadUrls.Count}...");
+
+                // Don't trust the URL for the filename: many hosts (e.g. Patreon's
+                // /file?h=..&m=.. links) resolve every part to the exact same path,
+                // which would make every part overwrite the previous one and leave
+                // SharpCompress trying to read a "multi-volume" RAR that's really
+                // just the last part's bytes under one name (IncompleteArchiveException).
+                // Download to a scratch name first, then rename using the part index
+                // and the file's real detected kind, so we get a guaranteed-unique
+                // "{id}.partNN.rar" per part - the pattern ChoosePrimaryArchivePart
+                // and SharpCompress's multi-volume RAR reader both expect.
+                var scratchPath = Path.Combine(partsDir, $"{mod.Id}.part{i + 1:00}.download");
 
                 var (downloaded, error) = await _httpDownloadService.DownloadAsync(
-                    url, partPath, downloadProgress ?? new Progress<DownloadProgressInfo>(), speedLimitMbps, cancellationToken);
+                    url, scratchPath, downloadProgress ?? new Progress<DownloadProgressInfo>(), speedLimitMbps, cancellationToken);
 
-                if (!downloaded) return (false, $"Failed to download '{fileName}': {error}");
+                if (!downloaded) return (false, $"Failed to download part {i + 1} of {mod.DownloadUrls.Count}: {error}");
 
+                var partPath = FinalizePartFileName(scratchPath);
                 partFiles.Add(partPath);
             }
 
@@ -85,17 +95,24 @@ public class ModInstallService
         return (true, null);
     }
 
-    private static string? GetFileNameFromUrl(string url)
+    /// <summary>
+    /// Renames a just-downloaded part (still using its scratch ".download" name)
+    /// to the correct extension based on its real content, detected via magic
+    /// bytes rather than trusted from the URL/server. Keeps the "{id}.partNN"
+    /// prefix so multi-volume RAR detection still works.
+    /// </summary>
+    private string FinalizePartFileName(string scratchPath)
     {
-        try
-        {
-            var fileName = Path.GetFileName(new Uri(url).AbsolutePath);
-            return string.IsNullOrWhiteSpace(fileName) ? null : fileName;
-        }
-        catch
-        {
-            return null;
-        }
+        var kind = _archiveExtractionService.DetectKind(scratchPath);
+        var ext = kind == ArchiveKind.Zip ? ".zip" : ".rar"; // defaults to .rar: every multi-part mod seen so far is RAR
+
+        var finalPath = Path.Combine(
+            Path.GetDirectoryName(scratchPath)!,
+            Path.GetFileNameWithoutExtension(scratchPath) + ext);
+
+        if (File.Exists(finalPath)) File.Delete(finalPath);
+        File.Move(scratchPath, finalPath);
+        return finalPath;
     }
 
     /// <summary>

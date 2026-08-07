@@ -14,9 +14,13 @@ public class ModRecord
     public string Id { get; set; } = string.Empty;
     public string Title { get; set; } = string.Empty;
     public string Description { get; set; } = string.Empty;
+    public string Author { get; set; } = string.Empty;
     public string PageUrl { get; set; } = string.Empty;
     /// <summary>Download URL(s) for this mod, in part order. A single-file mod just has one entry.</summary>
     public List<string> DownloadUrls { get; set; } = new();
+
+    /// <summary>Curated screenshots for the hover preview / mod details panel.</summary>
+    public List<string> ScreenshotUrls { get; set; } = new();
 
     /// <summary>Id of another mod in this catalog that this one requires to function, if any.</summary>
     public string? ParentId { get; set; }

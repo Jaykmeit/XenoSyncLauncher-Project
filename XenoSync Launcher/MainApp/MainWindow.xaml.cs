@@ -8,7 +8,12 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using Microsoft.Web.WebView2.Core;
 using XenoSyncLauncher.Models;
 using XenoSyncLauncher.Services;
 using XenoSyncLauncher.Settings;
@@ -42,6 +47,14 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<ModEntry> _mods;
     private readonly System.Windows.Data.CollectionViewSource _modsView = new();
     private readonly ObservableCollection<LogEntry> _logLines = new();
+
+    private bool _webViewInitAttempted;
+    private bool _webViewReady;
+    private string? _pagePreviewLoadedUrl;
+    private CancellationTokenSource? _modPreviewSlideshowCts;
+    private bool _slideshowFrontIsA = true;
+    private readonly DispatcherTimer _modPreviewCloseTimer;
+    private bool _cursorOverPreviewTrigger;
 
     /// <summary>Backing ModRecord for each ModEntry shown in the UI, keyed by Id.</summary>
     private Dictionary<string, ModRecord> _modRecordsById = new();
@@ -104,6 +117,12 @@ public partial class MainWindow : Window
 
         _autoUpdateTimer = new DispatcherTimer { Interval = AutoUpdateCheckInterval };
         _autoUpdateTimer.Tick += async (_, _) => await AutoUpdateTimer_TickAsync();
+
+        // Closes the preview flyout shortly after the cursor leaves both the mod
+        // title and the flyout itself - long enough that moving from one to the
+        // other (to actually interact with the embedded page) doesn't close it.
+        _modPreviewCloseTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        _modPreviewCloseTimer.Tick += (_, _) => CloseModPreviewIfCursorAway();
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -321,20 +340,43 @@ public partial class MainWindow : Window
         AppendLog("Log copied to clipboard.");
     }
 
-    private void ModListBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private void ExpandToggle_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement { DataContext: ModEntry parent }) return;
+
+        parent.IsExpanded = !parent.IsExpanded;
+
+        foreach (var child in _mods.Where(m => m.ParentId == parent.Id))
+            child.IsVisibleInTree = parent.IsExpanded;
+    }
+
+    private async void ModListBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (ModListBox.SelectedItem is not ModEntry mod)
         {
             ModDetailTitle.Text = "Select a mod";
             ModDetailDescription.Text = string.Empty;
+            ModDetailAuthorText.Visibility = Visibility.Collapsed;
             VisitModPageButton.IsEnabled = false;
+            await ShowModPagePreviewAsync(null);
             return;
         }
 
         ModDetailTitle.Text = mod.Title;
         ModDetailDescription.Text = mod.Description;
+        if (string.IsNullOrWhiteSpace(mod.Author))
+        {
+            ModDetailAuthorText.Visibility = Visibility.Collapsed;
+        }
+        else
+        {
+            ModDetailAuthorText.Text = $"by {mod.Author}";
+            ModDetailAuthorText.Visibility = Visibility.Visible;
+        }
         VisitModPageButton.Tag = mod.PageUrl;
         VisitModPageButton.IsEnabled = !string.IsNullOrWhiteSpace(mod.PageUrl);
+
+        await ShowModPagePreviewAsync(mod);
     }
 
     private async Task LoadModsAsync()
@@ -346,9 +388,11 @@ public partial class MainWindow : Window
         try
         {
             _mods.Clear();
+            var parentIds = records.Where(r => r.ParentId is not null).Select(r => r.ParentId!).ToHashSet();
+
             foreach (var record in records)
             {
-                var entry = ToModEntry(record, _modRecordsById);
+                var entry = ToModEntry(record, _modRecordsById, parentIds.Contains(record.Id));
                 entry.PropertyChanged += ModEntry_PropertyChanged;
                 _mods.Add(entry);
             }
@@ -361,7 +405,7 @@ public partial class MainWindow : Window
         await EnsureMandatoryModsInstalledAsync();
     }
 
-    private static ModEntry ToModEntry(ModRecord record, Dictionary<string, ModRecord> allRecords)
+    private static ModEntry ToModEntry(ModRecord record, Dictionary<string, ModRecord> allRecords, bool hasChildren)
     {
         string? parentTitle = null;
         if (record.ParentId is not null && allRecords.TryGetValue(record.ParentId, out var parent))
@@ -372,10 +416,14 @@ public partial class MainWindow : Window
             Id = record.Id,
             Title = record.Title,
             Description = record.Description,
+            Author = record.Author,
             PageUrl = record.PageUrl,
+            ScreenshotUrls = record.ScreenshotUrls,
             Category = record.Category,
             ParentId = record.ParentId,
             ParentTitle = parentTitle,
+            HasChildren = hasChildren,
+            IndentLevel = record.ParentId is null ? 0 : 1,
             IsChecked = record.IsEnabled
         };
     }
@@ -431,8 +479,10 @@ public partial class MainWindow : Window
                 {
                     AppendLog($"{record.Title} requires {parentRecord.Title} - enabling it first...");
 
+                    var parentEntry = _mods.FirstOrDefault(m => m.Id == parentRecord.Id);
                     var (parentSuccess, parentError) = await _modInstallService.EnableAsync(
-                        parentRecord, _settings.ModdedPath, downloadProgress: null, _settings.SpeedLimitMbps, msg => AppendLog(msg), CancellationToken.None);
+                        parentRecord, _settings.ModdedPath, MakeModDownloadProgress(parentEntry), _settings.SpeedLimitMbps, msg => AppendLog(msg), CancellationToken.None);
+                    if (parentEntry is not null) parentEntry.IsDownloading = false;
 
                     if (!parentSuccess)
                     {
@@ -443,11 +493,18 @@ public partial class MainWindow : Window
 
                     AppendLog($"Enabled mod: {parentRecord.Title}");
                     SyncModEntryCheckedById(parentRecord.Id, true);
+                    if (parentEntry is not null)
+                    {
+                        parentEntry.IsExpanded = true;
+                        foreach (var sibling in _mods.Where(m => m.ParentId == parentEntry.Id))
+                            sibling.IsVisibleInTree = true;
+                    }
                 }
 
                 AppendLog($"Downloading and enabling mod: {record.Title}...");
                 var (success, error) = await _modInstallService.EnableAsync(
-                    record, _settings.ModdedPath, downloadProgress: null, _settings.SpeedLimitMbps, msg => AppendLog(msg), CancellationToken.None);
+                    record, _settings.ModdedPath, MakeModDownloadProgress(entry), _settings.SpeedLimitMbps, msg => AppendLog(msg), CancellationToken.None);
+                entry.IsDownloading = false;
 
                 if (!success)
                 {
@@ -477,8 +534,30 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             AppendLog($"Failed to apply mod change for {record.Title}: {ex.Message}", LogLevel.Error);
+            entry.IsDownloading = false;
             SyncEntryChecked(entry, record);
         }
+    }
+
+    /// <summary>
+    /// Reports a mod's real download progress (bytes-based) onto its ModEntry's
+    /// IsDownloading/DownloadPercent, which the tree's inline progress bar is
+    /// bound to. Returns null if the entry isn't in the tree (shouldn't normally
+    /// happen), in which case EnableAsync just runs without a progress sink.
+    /// </summary>
+    private IProgress<DownloadProgressInfo>? MakeModDownloadProgress(ModEntry? entry)
+    {
+        if (entry is null) return null;
+
+        entry.IsDownloading = true;
+        entry.DownloadPercent = 0;
+
+        return new Progress<DownloadProgressInfo>(p =>
+        {
+            entry.DownloadPercent = p.TotalBytes is > 0
+                ? Math.Clamp(p.BytesReceived * 100.0 / p.TotalBytes.Value, 0, 100)
+                : 0;
+        });
     }
 
     private void SyncEntryChecked(ModEntry entry, ModRecord record)
@@ -505,6 +584,284 @@ public partial class MainWindow : Window
 
         var psi = new ProcessStartInfo(url) { UseShellExecute = true };
         Process.Start(psi);
+    }
+
+    // ---- Mod hover "bocadillo" (lightweight: title/author/description + screenshot slideshow, no embedded browser) ----
+
+    private void ModTitle_MouseEnter(object sender, MouseEventArgs e)
+    {
+        _cursorOverPreviewTrigger = true;
+        _modPreviewCloseTimer.Stop();
+
+        if (sender is not FrameworkElement { DataContext: ModEntry entry }) return;
+
+        ShowModPreviewBocadillo(entry);
+    }
+
+    private void ModTitle_MouseLeave(object sender, MouseEventArgs e)
+    {
+        _cursorOverPreviewTrigger = false;
+        _modPreviewCloseTimer.Start();
+    }
+
+    private void ModPreviewPopup_MouseEnter(object sender, MouseEventArgs e)
+    {
+        _modPreviewCloseTimer.Stop();
+    }
+
+    private void ModPreviewPopup_MouseLeave(object sender, MouseEventArgs e)
+    {
+        _modPreviewCloseTimer.Start();
+    }
+
+    /// <summary>Closes the bocadillo once the delay fires, but only if the cursor is over neither the trigger title nor the bocadillo itself.</summary>
+    private void CloseModPreviewIfCursorAway()
+    {
+        _modPreviewCloseTimer.Stop();
+        if (_cursorOverPreviewTrigger || ModPreviewPopup.IsMouseOver) return;
+
+        _modPreviewSlideshowCts?.Cancel();
+        AnimateModPreview(opening: false, onComplete: () => ModPreviewPopup.IsOpen = false);
+    }
+
+    private void ShowModPreviewBocadillo(ModEntry entry)
+    {
+        ModPreviewTitleText.Text = entry.Title;
+        ModPreviewDescriptionText.Text = entry.Description;
+
+        if (string.IsNullOrWhiteSpace(entry.Author))
+        {
+            ModPreviewAuthorText.Visibility = Visibility.Collapsed;
+        }
+        else
+        {
+            ModPreviewAuthorText.Text = $"by {entry.Author}";
+            ModPreviewAuthorText.Visibility = Visibility.Visible;
+        }
+
+        ModPreviewPopup.IsOpen = true;
+        AnimateModPreview(opening: true);
+
+        StartModPreviewSlideshow(entry.ScreenshotUrls);
+    }
+
+    /// <summary>
+    /// Cycles through a mod's curated screenshots (see ScreenshotUrls - these
+    /// aren't scraped live from the mod's page, since third-party sites vary
+    /// too much for reliable automated extraction) like a slideshow while the
+    /// bocadillo is open. Restarted on every hover so it always starts from
+    /// the first screenshot.
+    /// </summary>
+    private void StartModPreviewSlideshow(IReadOnlyList<string> screenshotUrls)
+    {
+        _modPreviewSlideshowCts?.Cancel();
+
+        // A crossfade animation from whatever mod was hovered previously might
+        // still be mid-flight (WPF animations run independently of the loop's
+        // CancellationToken). While an animation clock owns Opacity, setting it
+        // directly below is silently ignored, and the old animation finishing
+        // afterwards can leave the wrong image visible - hence "the previous
+        // mod's screenshot" bleeding into the new hover. Clearing the clocks
+        // first hands Opacity back to direct control.
+        ModPreviewSlideshowImageA.BeginAnimation(OpacityProperty, null);
+        ModPreviewSlideshowImageB.BeginAnimation(OpacityProperty, null);
+
+        if (screenshotUrls.Count == 0)
+        {
+            ModPreviewSlideshowImageA.Source = null;
+            ModPreviewSlideshowImageB.Source = null;
+            ModPreviewNoScreenshotsText.Visibility = Visibility.Visible;
+            return;
+        }
+
+        ModPreviewNoScreenshotsText.Visibility = Visibility.Collapsed;
+        _slideshowFrontIsA = true;
+        ModPreviewSlideshowImageA.Opacity = 1;
+        ModPreviewSlideshowImageB.Opacity = 0;
+        SetModPreviewImage(ModPreviewSlideshowImageA, screenshotUrls[0]);
+        if (screenshotUrls.Count == 1) return;
+
+        var cts = new CancellationTokenSource();
+        _modPreviewSlideshowCts = cts;
+        _ = RunSlideshowAsync(screenshotUrls, cts.Token);
+    }
+
+    private async Task RunSlideshowAsync(IReadOnlyList<string> screenshotUrls, CancellationToken token)
+    {
+        var index = 0;
+        while (!token.IsCancellationRequested)
+        {
+            try { await Task.Delay(TimeSpan.FromSeconds(2.5), token); }
+            catch (TaskCanceledException) { return; }
+
+            if (token.IsCancellationRequested) return;
+
+            index = (index + 1) % screenshotUrls.Count;
+            CrossfadeToImage(screenshotUrls[index]);
+        }
+    }
+
+    /// <summary>
+    /// Crossfades the slideshow to a new screenshot: loads it into the
+    /// currently-hidden Image, then fades that one in while fading the
+    /// currently-visible one out. Avoids the instant "flash" swap of a
+    /// single Image's Source changing.
+    /// </summary>
+    private void CrossfadeToImage(string url)
+    {
+        var incoming = _slideshowFrontIsA ? ModPreviewSlideshowImageB : ModPreviewSlideshowImageA;
+        var outgoing = _slideshowFrontIsA ? ModPreviewSlideshowImageA : ModPreviewSlideshowImageB;
+        _slideshowFrontIsA = !_slideshowFrontIsA;
+
+        SetModPreviewImage(incoming, url);
+
+        var duration = TimeSpan.FromMilliseconds(900);
+        incoming.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, duration));
+        outgoing.BeginAnimation(OpacityProperty, new DoubleAnimation(1, 0, duration));
+    }
+
+    private void SetModPreviewImage(Image target, string url)
+    {
+        try
+        {
+            target.Source = new BitmapImage(new Uri(url));
+        }
+        catch
+        {
+            // A single bad/unreachable screenshot URL shouldn't break the rest of the slideshow.
+            target.Source = null;
+        }
+    }
+
+    private void AnimateModPreview(bool opening, Action? onComplete = null)
+    {
+        var duration = TimeSpan.FromMilliseconds(140);
+        var easing = new QuadraticEase { EasingMode = opening ? EasingMode.EaseOut : EasingMode.EaseIn };
+
+        var scaleAnim = new DoubleAnimation(opening ? 0.85 : 1.0, opening ? 1.0 : 0.85, duration) { EasingFunction = easing };
+        var opacityAnim = new DoubleAnimation(opening ? 0.0 : 1.0, opening ? 1.0 : 0.0, duration) { EasingFunction = easing };
+
+        if (!opening && onComplete is not null)
+            opacityAnim.Completed += (_, _) => onComplete();
+
+        ModPreviewScaleTransform.BeginAnimation(ScaleTransform.ScaleXProperty, scaleAnim);
+        ModPreviewScaleTransform.BeginAnimation(ScaleTransform.ScaleYProperty, scaleAnim);
+        ((Border)ModPreviewPopup.Child).BeginAnimation(OpacityProperty, opacityAnim);
+    }
+
+    // ---- Mod Page Preview panel (persistent, updates on selection - not a hover popup) ----
+
+    /// <summary>
+    /// Loads the selected mod's real page into the persistent preview panel.
+    /// Deliberately NOT a Popup: WebView2 doesn't compose reliably inside a
+    /// transparent/layered Popup (it can escape as its own OS-chrome window,
+    /// which is what caused the hover flyout to misbehave) - a normal panel
+    /// that's part of the regular layout doesn't have that problem.
+    /// </summary>
+    private async Task ShowModPagePreviewAsync(ModEntry? entry)
+    {
+        if (entry is null || string.IsNullOrWhiteSpace(entry.PageUrl))
+        {
+            ModPagePreviewWebView.Visibility = Visibility.Collapsed;
+            ModPagePreviewFallbackText.Visibility = Visibility.Collapsed;
+            ModPagePreviewAuthorText.Visibility = Visibility.Collapsed;
+            ModPagePreviewEmptyText.Visibility = Visibility.Visible;
+            return;
+        }
+
+        ModPagePreviewEmptyText.Visibility = Visibility.Collapsed;
+
+        if (string.IsNullOrWhiteSpace(entry.Author))
+        {
+            ModPagePreviewAuthorText.Visibility = Visibility.Collapsed;
+        }
+        else
+        {
+            ModPagePreviewAuthorText.Text = $"by {entry.Author}";
+            ModPagePreviewAuthorText.Visibility = Visibility.Visible;
+        }
+
+        if (!await EnsurePagePreviewWebViewReadyAsync())
+        {
+            ModPagePreviewWebView.Visibility = Visibility.Collapsed;
+            ModPagePreviewFallbackText.Visibility = Visibility.Visible;
+            return;
+        }
+
+        ModPagePreviewFallbackText.Visibility = Visibility.Collapsed;
+        ModPagePreviewWebView.Visibility = Visibility.Visible;
+
+        if (_pagePreviewLoadedUrl == entry.PageUrl) return; // avoid a needless reload flash
+
+        try
+        {
+            ModPagePreviewWebView.CoreWebView2.Navigate(entry.PageUrl);
+            _pagePreviewLoadedUrl = entry.PageUrl;
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Couldn't load the page preview for {entry.Title}: {ex.Message}", LogLevel.Warning);
+            ModPagePreviewWebView.Visibility = Visibility.Collapsed;
+            ModPagePreviewFallbackText.Visibility = Visibility.Visible;
+        }
+    }
+
+    /// <summary>
+    /// Injected into the mod page preview after every navigation. Combines two
+    /// effects the user asked for: an horizontal "auto-fit" (shrinking the
+    /// body's layout width so pages with a wide/fixed layout reflow to fit
+    /// better) and a ~125% zoom that stays horizontally centered - using CSS
+    /// transform with transform-origin: top center instead of WebView2's
+    /// native ZoomFactor, since native zoom anchors from the top-left corner
+    /// rather than centering.
+    /// </summary>
+    private const string PagePreviewFitScript = """
+        (function() {
+            try {
+                document.documentElement.style.overflowX = 'hidden';
+                document.body.style.width = '80%';
+                document.body.style.marginLeft = 'auto';
+                document.body.style.marginRight = 'auto';
+                document.body.style.transformOrigin = 'top center';
+                document.body.style.transform = 'scale(1.25)';
+            } catch (e) { /* best-effort - some pages lock down document.body styles */ }
+        })();
+        """;
+
+    /// <summary>
+    /// Lazily creates the WebView2 environment on first selection rather than
+    /// at startup, since a session might never select a mod. If the WebView2
+    /// Runtime isn't installed, this fails once and every subsequent
+    /// selection falls back to the "open in browser" message instead of
+    /// retrying (and failing) each time.
+    /// </summary>
+    private async Task<bool> EnsurePagePreviewWebViewReadyAsync()
+    {
+        if (_webViewReady) return true;
+        if (_webViewInitAttempted) return false;
+
+        _webViewInitAttempted = true;
+        try
+        {
+            var userDataFolder = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "XenoSyncLauncher", "WebView2");
+
+            var environment = await CoreWebView2Environment.CreateAsync(userDataFolder: userDataFolder);
+            await ModPagePreviewWebView.EnsureCoreWebView2Async(environment);
+            ModPagePreviewWebView.CoreWebView2.NavigationCompleted += async (_, _) =>
+            {
+                try { await ModPagePreviewWebView.CoreWebView2.ExecuteScriptAsync(PagePreviewFitScript); }
+                catch { /* best-effort cosmetic tweak - a failed injection just leaves the page at its normal size */ }
+            };
+            _webViewReady = true;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Mod page previews are unavailable (WebView2 Runtime not found): {ex.Message}", LogLevel.Warning);
+            return false;
+        }
     }
 
     private void SettingsButton_Click(object sender, RoutedEventArgs e)
@@ -1043,10 +1400,11 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// Moves the extracted files into their final location.
-    /// TODO: the actual folder layout inside XV2Patcher's/Revamp's archives
-    /// hasn't been verified against the real downloads (see the note about
-    /// not being able to inspect a 4.5GB file from this environment) — adjust
-    /// the target paths below once you've confirmed what each archive contains.
+    /// Both XV2Patcher's and Revamp's archives wrap their payload in a single
+    /// top-level folder; that wrapper is flattened (see FlattenSingleWrapperFolder)
+    /// and its contents merged directly into the Modded root. Revamp's install is
+    /// additionally confirmed via its key file (see IsRevampInstalledCorrectly)
+    /// before being recorded - the process exiting isn't proof by itself.
     /// </summary>
     private async Task<bool> RunInstallTaskAsync(string componentKey, CancellationToken token)
     {
@@ -1060,20 +1418,43 @@ public partial class MainWindow : Window
 
         if (stagingDir.Length == 0)
         {
-            // An installer .exe already placed its own files during the extract step.
+            // An installer .exe already placed its own files during the extract step -
+            // but the installer closing isn't proof it succeeded, so confirm the key
+            // file is actually there before trusting it (see IsRevampInstalledCorrectly).
+            if (componentKey == "revamp" && !IsRevampInstalledCorrectly(_settings.ModdedPath))
+            {
+                AppendLog("Revamp's installer closed, but its key file (data/LB Mod Installer/revamp xenoverse 2 project_revamp team.xml) " +
+                          "wasn't found afterwards. Treating this as a failed install.", LogLevel.Error);
+                return false;
+            }
+
             RecordInstalledVersion(componentKey);
             return true;
         }
 
         try
         {
-            var targetDir = componentKey == "xv2patcher"
-                ? Path.Combine(_settings.ModdedPath, "XV2PATCHER")
-                : _settings.ModdedPath; // Revamp overlays its mod files directly into the Modded game folder
+            // Both XV2Patcher's and Revamp's archives wrap their real payload in a
+            // single top-level folder (e.g. "XV2Patcher_4.64/..."). Flatten that one
+            // level so the actual files land directly in the Modded root, rather than
+            // nesting them under an extra subfolder that XV2Patcher/Revamp never expect.
+            var effectiveSourceDir = FlattenSingleWrapperFolder(stagingDir);
 
-            await Task.Run(() => MergeDirectory(stagingDir, targetDir), token);
+            await Task.Run(() => MergeDirectory(effectiveSourceDir, _settings.ModdedPath), token);
+
+            if (componentKey == "revamp" && !IsRevampInstalledCorrectly(_settings.ModdedPath))
+            {
+                AppendLog("Revamp's key file (data/LB Mod Installer/revamp xenoverse 2 project_revamp team.xml) " +
+                          "wasn't found after copying its files. The install did not complete correctly.", LogLevel.Error);
+                return false;
+            }
 
             RecordInstalledVersion(componentKey);
+
+            // Now that the install is confirmed, the staging copy is no longer needed.
+            try { Directory.Delete(stagingDir, recursive: true); }
+            catch (Exception ex) { AppendLog($"Installed {componentKey}, but couldn't clean up the temp extraction folder: {ex.Message}", LogLevel.Warning); }
+
             return true;
         }
         catch (Exception ex)
@@ -1082,6 +1463,31 @@ public partial class MainWindow : Window
             return false;
         }
     }
+
+    /// <summary>
+    /// If <paramref name="dir"/> contains exactly one entry and it's a subfolder
+    /// (the typical "everything wrapped in one top folder" archive layout), returns
+    /// that subfolder's path instead, so callers merge its *contents* rather than
+    /// re-creating that wrapper folder inside the destination. Otherwise returns
+    /// <paramref name="dir"/> unchanged.
+    /// </summary>
+    private static string FlattenSingleWrapperFolder(string dir)
+    {
+        var entries = Directory.GetFileSystemEntries(dir);
+        if (entries.Length == 1 && Directory.Exists(entries[0]))
+            return entries[0];
+
+        return dir;
+    }
+
+    /// <summary>
+    /// Revamp's installer/archive is confirmed to have actually placed its files
+    /// once this file exists - it's created by the Revamp team's own installer and
+    /// isn't something XenoSync Launcher writes itself, so its presence is a
+    /// reliable signal (unlike just trusting that the installer process exited).
+    /// </summary>
+    private static bool IsRevampInstalledCorrectly(string moddedPath) =>
+        File.Exists(Path.Combine(moddedPath, "data", "LB Mod Installer", "revamp xenoverse 2 project_revamp team.xml"));
 
     /// <summary>
     /// Writes XenoSync's own version bookkeeping (see InstalledComponentVersionService)

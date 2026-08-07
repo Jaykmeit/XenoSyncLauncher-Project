@@ -6,9 +6,9 @@ namespace XenoSyncLauncher.Services;
 /// The list of xv2patcher.ini boolean flags XenoSync Launcher exposes as
 /// toggles in the XV2 Patcher Flags window.
 ///
-/// Deliberately NOT included: "excessive_air_contamination". XenoSync
-/// Launcher does not manage, describe, or toggle this flag. Users can still
-/// edit it manually in the ini file if they choose to.
+/// "excessive_air_contamination" (shown as "Online Mode") is set to true by
+/// default right after install - see DefaultPatcherFlags - but is still
+/// listed here so users can turn it off manually if they want offline-only.
 public static class PatcherFlagCatalog
 {
     public static IReadOnlyList<PatcherFlagDefinition> All { get; } = new List<PatcherFlagDefinition>

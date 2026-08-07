@@ -15,9 +15,11 @@ namespace XenoSyncLauncher.Models;
 ///     "id": "some-slug",
 ///     "title": "Mod Title",
 ///     "description": "What it does.",
+///     "author": "Author name/handle",
 ///     "pageUrl": "https://videogamemods.com/...",
 ///     "downloadUrl": "https://.../mod.zip",
-///     "category": "XenoSyncCore"   // or "Optional"
+///     "category": "XenoSyncCore",   // or "Optional"
+///     "screenshotUrls": ["https://.../shot1.jpg", "https://.../shot2.jpg"]
 ///   },
 ///   {
 ///     "id": "night-conton-city",
@@ -42,6 +44,7 @@ public class RemoteModDefinition
     public string? Id { get; set; }
     public string? Title { get; set; }
     public string? Description { get; set; }
+    public string? Author { get; set; }
     public string? PageUrl { get; set; }
 
     /// <summary>Single-file mods. Ignored if DownloadUrls is also set.</summary>
@@ -54,4 +57,11 @@ public class RemoteModDefinition
     public string? Parent { get; set; }
 
     public string? Category { get; set; }
+
+    /// <summary>
+    /// Curated screenshots (not scraped at runtime - third-party mod pages
+    /// vary wildly in markup and some block automated fetching) shown as a
+    /// small slideshow in the hover preview and the mod details panel.
+    /// </summary>
+    public List<string>? ScreenshotUrls { get; set; }
 }
