@@ -14,10 +14,11 @@ public static class DefaultPatcherFlags
         ("excessive_air_contamination", true), // Online mode enabled by default.
     };
 
-    public static void ApplyTo(string moddedPath, IniFlagService iniFlagService)
+    /// <summary>Returns false (and does nothing) if xv2patcher.ini isn't where expected - lets the caller report this honestly instead of assuming success.</summary>
+    public static bool ApplyTo(string moddedPath, IniFlagService iniFlagService)
     {
-        var iniPath = Path.Combine(moddedPath, "xv2patcher.ini");
-        if (!File.Exists(iniPath)) return;
+        var iniPath = Path.Combine(moddedPath, "XV2PATCHER", "xv2patcher.ini");
+        if (!File.Exists(iniPath)) return false;
 
         var lines = iniFlagService.ReadLines(iniPath);
 
@@ -25,5 +26,6 @@ public static class DefaultPatcherFlags
             iniFlagService.SetBoolValue(lines, key, value);
 
         iniFlagService.SaveLines(iniPath, lines);
+        return true;
     }
 }

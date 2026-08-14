@@ -49,10 +49,34 @@ public class UpdateTaskPlanner
         AddComponentTasks(plan, idPrefix: "xv2patcher", displayName: "XV2Patcher",
             targetVersion: comparison.LatestXv2PatcherVersion, isUpToDate: comparison.Xv2PatcherUpToDate && !forceReinstall);
 
+        AddXv2InsPrerequisiteTasks(plan, settings, forceReinstall);
+
         AddComponentTasks(plan, idPrefix: "revamp", displayName: "Xenoverse 2 Revamp",
             targetVersion: comparison.LatestRevampVersion, isUpToDate: comparison.RevampUpToDate && !forceReinstall);
 
         return plan;
+    }
+
+    /// <summary>
+    /// XV2INS + its two prerequisite files (xv2ins_dcd.rar, x2i7394.tmp.reg) -
+    /// together these let .x2m mods install automatically (see
+    /// ModInstallService.InstallViaX2mAsync) without needing XV2INS run
+    /// against a real Vanilla Steam install. Unlike XV2Patcher/Revamp there's
+    /// no "latest version" to track for these - they're a one-time setup, so
+    /// skipped entirely once XV2INS.exe is already present.
+    /// </summary>
+    private void AddXv2InsPrerequisiteTasks(List<UpdateTaskItem> plan, LauncherSettings? settings, bool forceReinstall)
+    {
+        if (settings?.ModdedPath is null) return;
+
+        var alreadySetUp = !forceReinstall
+            && System.IO.File.Exists(Path.Combine(settings.ModdedPath, "XV2INS.exe"))
+            && X2mRegistryAssociationService.IsX2mAssociated();
+        if (alreadySetUp) return;
+
+        AddComponentTasks(plan, idPrefix: "xv2ins", displayName: "XV2INS", targetVersion: null, isUpToDate: false);
+        AddComponentTasks(plan, idPrefix: "xv2ins-dcd", displayName: "XV2INS prerequisite files", targetVersion: null, isUpToDate: false);
+        AddComponentTasks(plan, idPrefix: "xv2ins-reg", displayName: "XV2INS file association", targetVersion: null, isUpToDate: false);
     }
 
     private void AddComponentTasks(List<UpdateTaskItem> plan, string idPrefix, string displayName, string? targetVersion, bool isUpToDate)

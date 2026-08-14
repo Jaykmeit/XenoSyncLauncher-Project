@@ -44,6 +44,16 @@ public class LauncherSettings
     /// forces XV2Patcher and Revamp to be reinstalled even if they're already
     /// at the latest version, and is cleared automatically once that plan is built.
     public bool ForceReinstallOnNextUpdate { get; set; }
+
+    /// <summary>
+    /// Where the launcher's own .exe/files actually live, for self-updating.
+    /// Defaults to AppContext.BaseDirectory (wherever it's currently running
+    /// from) the first time it's needed - only set explicitly if the launcher
+    /// was installed somewhere the self-updater needs to be told about
+    /// (rather than assuming "wherever I'm running from right now" is safe,
+    /// e.g. if launched via a shortcut from a different working directory).
+    /// </summary>
+    public string? InstallDirectory { get; set; }
 }
 
 public class SettingsService

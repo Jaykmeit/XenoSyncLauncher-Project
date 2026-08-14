@@ -35,4 +35,7 @@ public class ModRecord
 
     /// <summary>Relative paths (within the Modded folder) this mod last copied there. Used to remove exactly those files on disable, without touching other mods' files.</summary>
     public List<string> InstalledRelativeFiles { get; set; } = new();
+
+    /// <summary>True when this mod is recorded as enabled but its files couldn't be verified present on disk (deleted manually, a Modded reinstall, etc.) - a signal it needs a fresh Update/Reinstall, not that it's actually working right now.</summary>
+    public bool NeedsUpdate { get; set; }
 }

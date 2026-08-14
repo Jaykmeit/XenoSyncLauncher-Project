@@ -31,6 +31,28 @@ public class ArchiveExtractionService
         return ArchiveKind.Unknown;
     }
 
+    /// <summary>
+    /// True only if the archive can actually be opened and its entries fully
+    /// enumerated - not just that it starts with the right magic bytes.
+    /// DetectKind alone isn't enough to trust a *reused* cached download: a
+    /// truncated/corrupt file (e.g. from an interrupted previous run) can
+    /// still have a valid header while missing its central directory,
+    /// which only surfaces as a crash once extraction actually starts.
+    /// </summary>
+    public bool IsArchiveIntact(string filePath)
+    {
+        try
+        {
+            using var archive = ArchiveFactory.Open(filePath);
+            _ = archive.Entries.Count(); // forces SharpCompress to actually read through the archive's structure
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     /// <summary>Extracts every file entry to destinationDir, reporting (entriesDone, totalEntries) as it goes.</summary>
     public void Extract(string archivePath, string destinationDir, Action<int, int> onEntryExtracted)
     {

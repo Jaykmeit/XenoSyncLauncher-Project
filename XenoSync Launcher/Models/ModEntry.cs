@@ -30,6 +30,34 @@ public class ModEntry : INotifyPropertyChanged
     /// <summary>Curated screenshots for the hover preview slideshow. Empty for mods that haven't had any added to the catalog yet.</summary>
     public System.Collections.Generic.IReadOnlyList<string> ScreenshotUrls { get; init; } = System.Array.Empty<string>();
 
+    private bool _needsUpdate;
+    private bool _parentNeedsUpdate;
+
+    /// <summary>True when this mod is recorded as enabled but its files couldn't be verified present on disk - blocks any dependent child's checkbox until resolved.</summary>
+    public bool NeedsUpdate
+    {
+        get => _needsUpdate;
+        set
+        {
+            if (_needsUpdate == value) return;
+            _needsUpdate = value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>True when this mod's required parent (if any) has NeedsUpdate - can't safely toggle a mod on top of a parent that isn't verifiably there.</summary>
+    public bool ParentNeedsUpdate
+    {
+        get => _parentNeedsUpdate;
+        set
+        {
+            if (_parentNeedsUpdate == value) return;
+            _parentNeedsUpdate = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(IsCheckboxEnabled)); // IsCheckboxEnabled is computed from this, so WPF needs an explicit nudge to re-evaluate the binding
+        }
+    }
+
     /// <summary>
     /// URL shown/opened when the user clicks or hovers the mod title.
     /// For "Xenoverse 2 Revamp" this points to its VideogameMods platform page
@@ -74,8 +102,8 @@ public class ModEntry : INotifyPropertyChanged
         }
     }
 
-    /// <summary>The checkbox is only interactive for Optional mods; Revamp Core and XenoSync Core are always locked on.</summary>
-    public bool IsCheckboxEnabled => Category == ModCategory.Optional;
+    /// <summary>The checkbox is only interactive for Optional mods; Revamp Core and XenoSync Core are always locked on. Also locked if a required parent isn't verifiably installed - can't safely toggle a mod on top of one that needs an Update first.</summary>
+    public bool IsCheckboxEnabled => Category == ModCategory.Optional && !ParentNeedsUpdate;
 
     /// <summary>True while this mod (or the parent it's cascading through) is actively being downloaded. Drives the inline progress bar in the tree.</summary>
     public bool IsDownloading

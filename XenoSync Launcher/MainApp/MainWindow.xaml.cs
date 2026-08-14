@@ -2,8 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -23,6 +25,7 @@ namespace XenoSyncLauncher.MainApp;
 public partial class MainWindow : Window
 {
     private readonly ModCatalogService _modCatalogService = new();
+    private readonly SelfUpdateService _selfUpdateService = new();
     private readonly ModInstallService _modInstallService = new();
     private readonly LaunchInspectService _launchInspectService = new();
     private readonly VersionCheckService _versionCheckService = new();
@@ -51,8 +54,11 @@ public partial class MainWindow : Window
     private bool _webViewInitAttempted;
     private bool _webViewReady;
     private string? _pagePreviewLoadedUrl;
+    private readonly DispatcherTimer _pagePreviewResizeTimer;
     private CancellationTokenSource? _modPreviewSlideshowCts;
     private bool _slideshowFrontIsA = true;
+    private readonly Dictionary<string, BitmapImage> _screenshotCache = new();
+    private static readonly HttpClient ScreenshotHttpClient = new() { Timeout = TimeSpan.FromSeconds(10) };
     private readonly DispatcherTimer _modPreviewCloseTimer;
     private bool _cursorOverPreviewTrigger;
 
@@ -106,6 +112,8 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
 
+        LauncherVersionText.Text = $"v{LauncherVersion.Current}";
+
         _mods = new ObservableCollection<ModEntry>();
         _modsView.Source = _mods;
         _modsView.GroupDescriptions.Add(new System.Windows.Data.PropertyGroupDescription(nameof(ModEntry.CategoryGroupName)));
@@ -123,10 +131,26 @@ public partial class MainWindow : Window
         // other (to actually interact with the embedded page) doesn't close it.
         _modPreviewCloseTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
         _modPreviewCloseTimer.Tick += (_, _) => CloseModPreviewIfCursorAway();
+
+        // Debounces Mod Page Preview's re-fit so a continuous window
+        // drag-resize doesn't fire a script measurement on every pixel.
+        _pagePreviewResizeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
+        _pagePreviewResizeTimer.Tick += async (_, _) =>
+        {
+            _pagePreviewResizeTimer.Stop();
+            await FitPagePreviewZoomAsync();
+        };
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
+        // Priority #1, before anything else (including loading config.json):
+        // a launcher update, if one exists, is mandatory. This call returns
+        // normally if there's nothing to update; if there IS an update it
+        // applies it and exits the process, so nothing below this line runs
+        // in that case.
+        await CheckForLauncherUpdateAsync();
+
         _settings = _settingsService.Load();
 
         if (_settings is null)
@@ -137,8 +161,20 @@ public partial class MainWindow : Window
 
         AppendLog("Configuration loaded.");
         RefreshAutoUpdateTimerState();
+
+        // Startup only checks/reports status - it never installs anything on
+        // its own. Mods are loaded (display only, nothing installed - see
+        // LoadModsAsync) before Launch Inspect, since Launch Inspect's
+        // "everything up to date" check looks at the loaded mod list too;
+        // checking before it's loaded would trivially say "up to date"
+        // (nothing to compare against yet) even when mods actually need
+        // installing, leaving the log and Run's real (correctly disabled)
+        // state out of sync.
         await LoadModsAsync();
         await RunLaunchInspectAsync();
+
+        if (!_status.IsXenoverse2Installed || !_status.IsXv2PatcherUpToDate || !_status.IsRevampUpToDate)
+            AppendLog("XV2Patcher/Revamp/XV2INS are missing or outdated - press Update to fix this.", LogLevel.Warning);
     }
 
     private void RefreshAutoUpdateTimerState()
@@ -147,6 +183,37 @@ public partial class MainWindow : Window
             _autoUpdateTimer.Start();
         else
             _autoUpdateTimer.Stop();
+    }
+
+    /// <summary>
+    /// Checks GitHub Releases for a newer launcher build. If one exists, it
+    /// is mandatory - downloads and applies it automatically without asking,
+    /// then restarts. See SelfUpdateService for how a running .exe can
+    /// replace its own files.
+    /// </summary>
+    private async Task CheckForLauncherUpdateAsync()
+    {
+        var (latestVersion, downloadUrl) = await _selfUpdateService.CheckForUpdateAsync(CancellationToken.None);
+        if (!SelfUpdateService.IsNewerVersion(latestVersion) || string.IsNullOrWhiteSpace(downloadUrl))
+            return;
+
+        AppendLog($"A new launcher version is available: {latestVersion} (current: {LauncherVersion.Current}). This update is required - installing it now...");
+
+        var extractedDir = await _selfUpdateService.DownloadAndExtractAsync(downloadUrl, progress: null, CancellationToken.None);
+        if (extractedDir is null)
+        {
+            AppendLog("Couldn't download the required launcher update - continuing on the current version for now.", LogLevel.Error);
+            return;
+        }
+
+        var installDir = _settings?.InstallDirectory;
+        if (string.IsNullOrWhiteSpace(installDir))
+            installDir = AppContext.BaseDirectory;
+
+        var exeFileName = Path.GetFileName(Environment.ProcessPath) ?? "XenoSync Launcher.exe";
+
+        AppendLog("Applying the update - the launcher will restart in a moment...");
+        _selfUpdateService.ApplyUpdateAndRestart(extractedDir, installDir, exeFileName);
     }
 
     private async Task AutoUpdateTimer_TickAsync()
@@ -188,12 +255,34 @@ public partial class MainWindow : Window
 
         AppendLog("Running Launch Inspect...");
 
+        // installed-versions.json is bookkeeping written right after a
+        // successful install - it doesn't get updated if the files
+        // themselves later disappear (Modded reinstall, manual cleanup, a
+        // botched previous run...). Don't trust a recorded version unless
+        // the component's actual key file is still there, or "up to date"
+        // can end up true while the real install is missing entirely.
+        var recordedRevampVersion = await _launchInspectService.GetInstalledRevampVersionAsync(_settings.ModdedPath);
+        var revampFilesVerified = System.IO.File.Exists(Path.Combine(_settings.ModdedPath, "data", "LB Mod Installer", "revamp xenoverse 2 project_revamp team.xml"));
+
+        var recordedPatcherVersion = await _launchInspectService.GetInstalledXv2PatcherVersionAsync(_settings.ModdedPath);
+        var patcherFilesVerified = System.IO.File.Exists(Xv2PatcherIniPath(_settings.ModdedPath));
+
+        // ApplyTo is otherwise only called right after a *fresh* XV2Patcher
+        // install (see the "install-xv2patcher" task completion below) - a
+        // session that starts with XV2Patcher already installed never runs
+        // that task at all, so excessive_air_contamination (or any other
+        // default flag) could silently drift back to false and never get
+        // corrected. Re-checking here runs on every Launch Inspect pass,
+        // including at startup, regardless of whether an install just happened.
+        if (patcherFilesVerified)
+            DefaultPatcherFlags.ApplyTo(_settings.ModdedPath, _iniFlagService);
+
         var comparison = new VersionComparison
         {
             LatestRevampVersion = await _launchInspectService.GetLatestRevampVersionAsync(),
             LatestXv2PatcherVersion = await _launchInspectService.GetLatestXv2PatcherVersionAsync(),
-            InstalledRevampVersion = await _launchInspectService.GetInstalledRevampVersionAsync(_settings.ModdedPath),
-            InstalledXv2PatcherVersion = await _launchInspectService.GetInstalledXv2PatcherVersionAsync(_settings.ModdedPath)
+            InstalledRevampVersion = revampFilesVerified ? recordedRevampVersion : null,
+            InstalledXv2PatcherVersion = patcherFilesVerified ? recordedPatcherVersion : null
         };
 
         _lastComparison = comparison;
@@ -208,7 +297,7 @@ public partial class MainWindow : Window
         _status.IsXv2PatcherUpToDate = comparison.Xv2PatcherUpToDate;
 
         SetLiveIndicator(_status.IsXenoverse2Installed);
-        RunButton.IsEnabled = _status.CanRun;
+        RefreshRunButtonState();
 
         AppendLog(_status.CanRun
             ? "Everything is up to date. Run is enabled."
@@ -379,6 +468,13 @@ public partial class MainWindow : Window
         await ShowModPagePreviewAsync(mod);
     }
 
+    /// <summary>Recomputes InstallationStatus.AreAllModsUpToDate from the current mod records and refreshes Run's enabled state. Called after mods load and after any mod's enable/disable state changes.</summary>
+    private void RefreshRunButtonState()
+    {
+        _status.AreAllModsUpToDate = !_modRecordsById.Values.Any(m => m.NeedsUpdate);
+        RunButton.IsEnabled = _status.CanRun;
+    }
+
     private async Task LoadModsAsync()
     {
         var records = await _modCatalogService.LoadAsync(_settings?.ModdedPath);
@@ -402,14 +498,18 @@ public partial class MainWindow : Window
             _isApplyingModChanges = false;
         }
 
-        await EnsureMandatoryModsInstalledAsync();
+        RefreshRunButtonState();
     }
 
     private static ModEntry ToModEntry(ModRecord record, Dictionary<string, ModRecord> allRecords, bool hasChildren)
     {
         string? parentTitle = null;
+        bool parentNeedsUpdate = false;
         if (record.ParentId is not null && allRecords.TryGetValue(record.ParentId, out var parent))
+        {
             parentTitle = parent.Title;
+            parentNeedsUpdate = parent.NeedsUpdate;
+        }
 
         return new ModEntry
         {
@@ -424,7 +524,9 @@ public partial class MainWindow : Window
             ParentTitle = parentTitle,
             HasChildren = hasChildren,
             IndentLevel = record.ParentId is null ? 0 : 1,
-            IsChecked = record.IsEnabled
+            IsChecked = record.IsEnabled,
+            NeedsUpdate = record.NeedsUpdate,
+            ParentNeedsUpdate = parentNeedsUpdate
         };
     }
 
@@ -433,23 +535,53 @@ public partial class MainWindow : Window
     /// hasn't installed yet. Runs quietly in the background after mods load;
     /// each mod logs its own progress like the XV2Patcher/Revamp installs do.
     /// </summary>
+    /// <summary>
+    /// Makes every mod's real on-disk state match what it's recorded/checked
+    /// as: XenoSyncCore mods are always force-installed (unconditionally
+    /// required), and any other mod (Optional or Revamp Core) that's
+    /// recorded enabled but has NeedsUpdate (its files were verified missing)
+    /// gets silently reinstalled. The checkbox already expresses the intent
+    /// "this should be on" - fixing it doesn't require unchecking/rechecking,
+    /// it just needs Update to actually go do the work.
+    /// </summary>
     private async Task EnsureMandatoryModsInstalledAsync()
     {
         if (_settings?.ModdedPath is null) return;
 
-        foreach (var record in _modRecordsById.Values.Where(m => m.Category == ModCategory.XenoSyncCore))
+        var pending = new List<ModRecord>();
+        foreach (var record in _modRecordsById.Values)
         {
-            if (!string.IsNullOrWhiteSpace(record.RepositoryFolder) && record.InstalledRelativeFiles.Count > 0)
-                continue; // already installed on this device
+            bool isXenoSyncCore = record.Category == ModCategory.XenoSyncCore;
+            if (!isXenoSyncCore && !(record.IsEnabled && record.NeedsUpdate))
+                continue; // Optional/RevampCore mods only get touched here if they're both enabled and verified broken
 
-            AppendLog($"Installing mandatory mod: {record.Title}...");
+            bool alreadyInstalled = !string.IsNullOrWhiteSpace(record.RepositoryFolder) && record.InstalledRelativeFiles.Count > 0;
+            if (isXenoSyncCore && alreadyInstalled && !record.NeedsUpdate)
+                continue; // already installed on this device, and files were verified present
 
-            var (success, error) = await _modInstallService.EnableAsync(
-                record, _settings.ModdedPath, downloadProgress: null, _settings.SpeedLimitMbps, msg => AppendLog(msg), CancellationToken.None);
+            pending.Add(record);
+        }
+
+        if (pending.Count == 0) return;
+
+        AppendLog(pending.Count == 1
+            ? $"Installing {pending[0].Title}..."
+            : $"Installing {pending.Count} mods (grouping any .x2m ones into a single XV2INS pass where possible)...");
+
+        var results = await _modInstallService.InstallBatchAsync(
+            pending, _settings.ModdedPath, downloadProgress: null, _settings.SpeedLimitMbps, msg => AppendLog(msg), CancellationToken.None);
+
+        foreach (var record in pending)
+        {
+            var (success, error) = results.TryGetValue(record.Id, out var result) ? result : (false, "No result was reported for this mod.");
+
+            record.NeedsUpdate = !success;
+            SyncModEntryNeedsUpdate(record.Id, !success);
+            if (success) SyncModEntryCheckedById(record.Id, true);
 
             AppendLog(success
-                ? $"Installed mandatory mod: {record.Title}."
-                : $"Failed to install mandatory mod {record.Title}: {error}");
+                ? $"Installed: {record.Title}."
+                : $"Failed to install {record.Title}: {error}", success ? LogLevel.Info : LogLevel.Error);
         }
 
         _modCatalogService.Save(_modRecordsById.Values.ToList());
@@ -492,6 +624,8 @@ public partial class MainWindow : Window
                     }
 
                     AppendLog($"Enabled mod: {parentRecord.Title}");
+                    parentRecord.NeedsUpdate = false;
+                    SyncModEntryNeedsUpdate(parentRecord.Id, false);
                     SyncModEntryCheckedById(parentRecord.Id, true);
                     if (parentEntry is not null)
                     {
@@ -514,22 +648,29 @@ public partial class MainWindow : Window
                 }
 
                 AppendLog($"Enabled mod: {record.Title}");
+                record.NeedsUpdate = false;
+                SyncModEntryNeedsUpdate(record.Id, false);
             }
             else if (!entry.IsChecked && record.IsEnabled)
             {
                 _modInstallService.Disable(record, _settings.ModdedPath);
+                record.NeedsUpdate = false;
+                SyncModEntryNeedsUpdate(record.Id, false);
                 AppendLog($"Disabled mod: {record.Title}");
 
                 // Cascade: a mod that required this one can't keep working without it.
                 foreach (var child in _modRecordsById.Values.Where(m => m.ParentId == record.Id && m.IsEnabled))
                 {
                     _modInstallService.Disable(child, _settings.ModdedPath);
+                    child.NeedsUpdate = false;
+                    SyncModEntryNeedsUpdate(child.Id, false);
                     AppendLog($"Disabled mod: {child.Title} (required {record.Title}).");
                     SyncModEntryCheckedById(child.Id, false);
                 }
             }
 
             _modCatalogService.Save(_modRecordsById.Values.ToList());
+            RefreshRunButtonState();
         }
         catch (Exception ex)
         {
@@ -576,6 +717,16 @@ public partial class MainWindow : Window
         _isApplyingModChanges = true;
         entry.IsChecked = isChecked;
         _isApplyingModChanges = false;
+    }
+
+    /// <summary>Keeps a mod's live ModEntry.NeedsUpdate (and any children's ParentNeedsUpdate) in sync after fixing/breaking it, without needing a full mod list reload.</summary>
+    private void SyncModEntryNeedsUpdate(string modId, bool needsUpdate)
+    {
+        var entry = _mods.FirstOrDefault(m => m.Id == modId);
+        if (entry is not null) entry.NeedsUpdate = needsUpdate;
+
+        foreach (var child in _mods.Where(m => m.ParentId == modId))
+            child.ParentNeedsUpdate = needsUpdate;
     }
 
     private void VisitModPageButton_Click(object sender, RoutedEventArgs e)
@@ -665,21 +816,20 @@ public partial class MainWindow : Window
         // first hands Opacity back to direct control.
         ModPreviewSlideshowImageA.BeginAnimation(OpacityProperty, null);
         ModPreviewSlideshowImageB.BeginAnimation(OpacityProperty, null);
+        ModPreviewSlideshowImageA.Source = null;
+        ModPreviewSlideshowImageB.Source = null;
+        ModPreviewSlideshowImageA.Opacity = 1;
+        ModPreviewSlideshowImageB.Opacity = 0;
+        _slideshowFrontIsA = true;
 
         if (screenshotUrls.Count == 0)
         {
-            ModPreviewSlideshowImageA.Source = null;
-            ModPreviewSlideshowImageB.Source = null;
+            ModPreviewNoScreenshotsText.Text = "No screenshots available";
             ModPreviewNoScreenshotsText.Visibility = Visibility.Visible;
             return;
         }
 
         ModPreviewNoScreenshotsText.Visibility = Visibility.Collapsed;
-        _slideshowFrontIsA = true;
-        ModPreviewSlideshowImageA.Opacity = 1;
-        ModPreviewSlideshowImageB.Opacity = 0;
-        SetModPreviewImage(ModPreviewSlideshowImageA, screenshotUrls[0]);
-        if (screenshotUrls.Count == 1) return;
 
         var cts = new CancellationTokenSource();
         _modPreviewSlideshowCts = cts;
@@ -689,47 +839,101 @@ public partial class MainWindow : Window
     private async Task RunSlideshowAsync(IReadOnlyList<string> screenshotUrls, CancellationToken token)
     {
         var index = 0;
+        var consecutiveFailures = 0;
+
         while (!token.IsCancellationRequested)
         {
-            try { await Task.Delay(TimeSpan.FromSeconds(2.5), token); }
-            catch (TaskCanceledException) { return; }
-
+            var bitmap = await GetScreenshotAsync(screenshotUrls[index], token);
             if (token.IsCancellationRequested) return;
 
+            if (bitmap is not null)
+            {
+                consecutiveFailures = 0;
+                CrossfadeToImage(bitmap);
+
+                if (screenshotUrls.Count == 1) return; // nothing else to cycle to
+
+                try { await Task.Delay(TimeSpan.FromSeconds(2.5), token); }
+                catch (TaskCanceledException) { return; }
+            }
+            else
+            {
+                // Skip a screenshot that failed to load instead of sitting on a
+                // blank/gray frame for the full interval - move on right away.
+                consecutiveFailures++;
+                if (consecutiveFailures >= screenshotUrls.Count)
+                {
+                    ModPreviewNoScreenshotsText.Text = "Couldn't load screenshots";
+                    ModPreviewNoScreenshotsText.Visibility = Visibility.Visible;
+                    return;
+                }
+            }
+
+            if (token.IsCancellationRequested) return;
             index = (index + 1) % screenshotUrls.Count;
-            CrossfadeToImage(screenshotUrls[index]);
         }
     }
 
     /// <summary>
-    /// Crossfades the slideshow to a new screenshot: loads it into the
-    /// currently-hidden Image, then fades that one in while fading the
-    /// currently-visible one out. Avoids the instant "flash" swap of a
-    /// single Image's Source changing.
+    /// Crossfades the slideshow to an already-decoded screenshot: loads it into
+    /// the currently-hidden Image, then fades that one in while fading the
+    /// currently-visible one out. Avoids the instant "flash" swap of a single
+    /// Image's Source changing.
     /// </summary>
-    private void CrossfadeToImage(string url)
+    private void CrossfadeToImage(BitmapImage bitmap)
     {
         var incoming = _slideshowFrontIsA ? ModPreviewSlideshowImageB : ModPreviewSlideshowImageA;
         var outgoing = _slideshowFrontIsA ? ModPreviewSlideshowImageA : ModPreviewSlideshowImageB;
         _slideshowFrontIsA = !_slideshowFrontIsA;
 
-        SetModPreviewImage(incoming, url);
+        incoming.Source = bitmap;
 
         var duration = TimeSpan.FromMilliseconds(900);
         incoming.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, duration));
         outgoing.BeginAnimation(OpacityProperty, new DoubleAnimation(1, 0, duration));
     }
 
-    private void SetModPreviewImage(Image target, string url)
+    /// <summary>
+    /// Downloads and decodes a screenshot ourselves (cached per-URL for the
+    /// rest of the session) instead of letting WPF's BitmapImage fetch it
+    /// directly. BitmapImage sends no Referer header at all, and some
+    /// mod-hosting CDNs (VideogameMods' included) silently reject image
+    /// requests that don't look like they came from a browser tab on their
+    /// own site after the first handful - which is what was causing
+    /// screenshots partway through the slideshow to come back blank/gray.
+    /// </summary>
+    private async Task<BitmapImage?> GetScreenshotAsync(string url, CancellationToken token)
     {
+        if (_screenshotCache.TryGetValue(url, out var cached)) return cached;
+
         try
         {
-            target.Source = new BitmapImage(new Uri(url));
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            var origin = new Uri(url).GetLeftPart(UriPartial.Authority);
+            request.Headers.Referrer = new Uri(origin + "/");
+            request.Headers.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) XenoSyncLauncher");
+
+            using var response = await ScreenshotHttpClient.SendAsync(request, token);
+            if (!response.IsSuccessStatusCode) return null;
+
+            var bytes = await response.Content.ReadAsByteArrayAsync(token);
+
+            var bitmap = new BitmapImage();
+            using (var stream = new MemoryStream(bytes))
+            {
+                bitmap.BeginInit();
+                bitmap.CacheOption = BitmapCacheOption.OnLoad;
+                bitmap.StreamSource = stream;
+                bitmap.EndInit();
+            }
+            bitmap.Freeze(); // makes it safely reusable/cacheable
+
+            _screenshotCache[url] = bitmap;
+            return bitmap;
         }
         catch
         {
-            // A single bad/unreachable screenshot URL shouldn't break the rest of the slideshow.
-            target.Source = null;
+            return null;
         }
     }
 
@@ -807,26 +1011,44 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Injected into the mod page preview after every navigation. Combines two
-    /// effects the user asked for: an horizontal "auto-fit" (shrinking the
-    /// body's layout width so pages with a wide/fixed layout reflow to fit
-    /// better) and a ~125% zoom that stays horizontally centered - using CSS
-    /// transform with transform-origin: top center instead of WebView2's
-    /// native ZoomFactor, since native zoom anchors from the top-left corner
-    /// rather than centering.
+    /// Measures the page's real content width and sets WebView2's native
+    /// ZoomFactor so it fits the panel horizontally - the same mechanism as
+    /// Ctrl+scroll page zoom in a real browser (as opposed to a CSS
+    /// transform, which was tried first and consistently broke Wix pages
+    /// like Revamp's: applying `transform` to any ancestor makes
+    /// `position: fixed` descendants position themselves relative to that
+    /// ancestor instead of the real viewport, per the CSS spec - Wix relies
+    /// on fixed-position full-height sections/backgrounds throughout, so
+    /// this collapsed their height and produced a genuine horizontal
+    /// overflow. Native zoom is a render-layer effect a page's own JS/CSS
+    /// can't see or be confused by, so it can't trigger that at all.
     /// </summary>
-    private const string PagePreviewFitScript = """
-        (function() {
-            try {
-                document.documentElement.style.overflowX = 'hidden';
-                document.body.style.width = '80%';
-                document.body.style.marginLeft = 'auto';
-                document.body.style.marginRight = 'auto';
-                document.body.style.transformOrigin = 'top center';
-                document.body.style.transform = 'scale(1.25)';
-            } catch (e) { /* best-effort - some pages lock down document.body styles */ }
-        })();
-        """;
+    private async Task FitPagePreviewZoomAsync()
+    {
+        if (!_webViewReady || ModPagePreviewWebView.CoreWebView2 is null) return;
+
+        var viewportWidth = ModPagePreviewWebView.ActualWidth;
+        if (viewportWidth <= 0) return;
+
+        try
+        {
+            // scrollWidth is measured in CSS pixels, which page zoom doesn't
+            // affect, so there's no need to reset zoom before measuring.
+            var resultJson = await ModPagePreviewWebView.CoreWebView2.ExecuteScriptAsync(
+                "Math.max(document.body ? document.body.scrollWidth : 0, document.documentElement.scrollWidth)");
+
+            if (!double.TryParse(resultJson, NumberStyles.Any, CultureInfo.InvariantCulture, out var contentWidth) || contentWidth <= 0)
+                return;
+
+            var zoom = viewportWidth / contentWidth;
+            // A fit pass, not a dramatic zoom either way: don't shrink small
+            // enough to become unreadable, don't zoom in past a light bump.
+            zoom = Math.Clamp(zoom, 0.35, 1.1);
+
+            ModPagePreviewWebView.ZoomFactor = zoom;
+        }
+        catch { /* best-effort cosmetic tweak - a failed measurement just leaves the page at its previous zoom */ }
+    }
 
     /// <summary>
     /// Lazily creates the WebView2 environment on first selection rather than
@@ -851,9 +1073,22 @@ public partial class MainWindow : Window
             await ModPagePreviewWebView.EnsureCoreWebView2Async(environment);
             ModPagePreviewWebView.CoreWebView2.NavigationCompleted += async (_, _) =>
             {
-                try { await ModPagePreviewWebView.CoreWebView2.ExecuteScriptAsync(PagePreviewFitScript); }
-                catch { /* best-effort cosmetic tweak - a failed injection just leaves the page at its normal size */ }
+                await FitPagePreviewZoomAsync();
+                // Some pages (e.g. Wix sites) finish laying out slightly after
+                // NavigationCompleted fires - re-measure a moment later too.
+                await Task.Delay(600);
+                await FitPagePreviewZoomAsync();
             };
+
+            // Re-fit whenever the panel is resized (e.g. the launcher window
+            // being resized). Debounced so a continuous drag-resize doesn't
+            // fire a script measurement on every single pixel of movement.
+            ModPagePreviewWebView.SizeChanged += (_, _) =>
+            {
+                _pagePreviewResizeTimer.Stop();
+                _pagePreviewResizeTimer.Start();
+            };
+
             _webViewReady = true;
             return true;
         }
@@ -899,7 +1134,7 @@ public partial class MainWindow : Window
     private void UpdateButton_Click(object sender, RoutedEventArgs e) => StartUpdate();
 
     /// <summary>Kicks off the update pipeline. Called from the Update button, and from the Auto-Update timer.</summary>
-    private void StartUpdate()
+    private async void StartUpdate()
     {
         if (_lastComparison is null) return;
         if (_activityState != LauncherActivityState.Idle) return; // already updating/paused
@@ -914,7 +1149,17 @@ public partial class MainWindow : Window
 
         if (_updateTasks.Count == 0)
         {
-            AppendLog("Nothing to update — all components are already at the latest version.");
+            // The version-based planner only covers XV2Patcher/Revamp/XV2INS -
+            // it has no concept of an individual mod needing reinstalling, so
+            // that's handled explicitly here instead (this is still part of
+            // the Update flow, just the no-op-for-those-three-components path).
+            await LoadModsAsync();
+            await EnsureMandatoryModsInstalledAsync();
+            await RunLaunchInspectAsync();
+
+            AppendLog(_status.AreAllModsUpToDate
+                ? "Nothing to update — all components are already at the latest version."
+                : "XV2Patcher/Revamp/XV2INS are up to date, but some mods still couldn't be reinstalled — check the log above for details.");
             return;
         }
 
@@ -986,8 +1231,11 @@ public partial class MainWindow : Window
 
             if (task.Id == "install-xv2patcher" && _settings?.ModdedPath is not null)
             {
-                DefaultPatcherFlags.ApplyTo(_settings.ModdedPath, _iniFlagService);
-                AppendLog("Applied default XV2Patcher flags (all stages unlocked).");
+                var appliedFlags = DefaultPatcherFlags.ApplyTo(_settings.ModdedPath, _iniFlagService);
+                AppendLog(appliedFlags
+                    ? "Applied default XV2Patcher flags (all stages unlocked)."
+                    : $"Couldn't find xv2patcher.ini at '{Xv2PatcherIniPath(_settings.ModdedPath)}' after installing XV2Patcher - its files may have landed in an unexpected subfolder. See the file listing above.",
+                    appliedFlags ? LogLevel.Info : LogLevel.Error);
             }
 
             if (task.Phase == UpdatePhase.Download && !task.IsRealDepotDownload)
@@ -1252,10 +1500,23 @@ public partial class MainWindow : Window
         {
             "download-xv2patcher" => await RunHttpDownloadTaskAsync(task, "xv2patcher", await _componentDownloadService.GetXv2PatcherDownloadUrlAsync(), token),
             "download-revamp" => await RunRevampDownloadTaskAsync(task, "revamp", await _componentDownloadService.GetRevampGoogleDriveFileIdAsync(), token),
+            "download-xv2ins" => await RunHttpDownloadTaskAsync(task, "xv2ins", await _componentDownloadService.GetXv2InsDownloadUrlAsync(), token),
+            "download-xv2ins-dcd" => await RunHttpDownloadTaskAsync(task, "xv2ins-dcd", await _componentDownloadService.GetXv2InsDcdDownloadUrlAsync(), token),
+            "download-xv2ins-reg" => await RunHttpDownloadTaskAsync(task, "xv2ins-reg", await _componentDownloadService.GetXv2InsRegDownloadUrlAsync(), token),
             "extract-xv2patcher" => await RunExtractOrLaunchTaskAsync("xv2patcher", token),
             "extract-revamp" => await RunExtractOrLaunchTaskAsync("revamp", token),
+            "extract-xv2ins" => await RunExtractOrLaunchTaskAsync("xv2ins", token),
+            "extract-xv2ins-dcd" => await RunExtractOrLaunchTaskAsync("xv2ins-dcd", token),
+            // x2i7394.tmp.reg isn't an archive - DetectKind sees it as ArchiveKind.Unknown,
+            // so this hits the same "shell-execute it, wait for it to close" branch a real
+            // installer .exe would (see RunExtractOrLaunchTaskAsync). That's exactly the
+            // "mero execute" (double-click, confirm the regedit prompt) behavior wanted.
+            "extract-xv2ins-reg" => await RunExtractOrLaunchTaskAsync("xv2ins-reg", token),
             "install-xv2patcher" => await RunInstallTaskAsync("xv2patcher", token),
             "install-revamp" => await RunInstallTaskAsync("revamp", token),
+            "install-xv2ins" => await RunInstallTaskAsync("xv2ins", token),
+            "install-xv2ins-dcd" => await RunInstallTaskAsync("xv2ins-dcd", token),
+            "install-xv2ins-reg" => await RunInstallTaskAsync("xv2ins-reg", token),
             _ => await SimulateTaskAsync(task, token)
         };
     }
@@ -1263,6 +1524,31 @@ public partial class MainWindow : Window
     private async Task<bool> RunHttpDownloadTaskAsync(UpdateTaskItem task, string componentKey, string url, CancellationToken token)
     {
         var tempFile = Path.Combine(Path.GetTempPath(), "XenoSyncLauncher", "Components", $"{componentKey}.download");
+
+        // This path is deterministic (always "{componentKey}.download"), so a
+        // previous run's download can still be sitting here - reuse it
+        // instead of re-downloading from scratch. A quick sanity check
+        // (recognizable archive, or just non-empty for non-archive
+        // components like the .reg) guards against reusing a corrupt/partial
+        // leftover from an interrupted previous attempt.
+        if (System.IO.File.Exists(tempFile))
+        {
+            var info = new FileInfo(tempFile);
+            var looksValid = componentKey == "xv2ins-reg"
+                ? info.Length > 0
+                : _archiveExtractionService.IsArchiveIntact(tempFile);
+
+            if (looksValid)
+            {
+                AppendLog($"{task.DisplayName} was already downloaded earlier - reusing it instead of downloading again.");
+                task.ExpectedTotalBytes = task.BytesDownloaded = info.Length;
+                _componentDownloadedFiles[componentKey] = tempFile;
+                return true;
+            }
+
+            // Don't let the download below "resume" on top of corrupt/truncated bytes.
+            try { System.IO.File.Delete(tempFile); } catch { /* best-effort - a failed delete just means DownloadAsync overwrites it instead */ }
+        }
 
         var progress = new Progress<DownloadProgressInfo>(p =>
         {
@@ -1294,6 +1580,24 @@ public partial class MainWindow : Window
     private async Task<bool> RunRevampDownloadTaskAsync(UpdateTaskItem task, string componentKey, string fileId, CancellationToken token)
     {
         var tempFile = Path.Combine(Path.GetTempPath(), "XenoSyncLauncher", "Components", $"{componentKey}.download");
+
+        // Revamp's download is multi-GB - definitely worth reusing a
+        // previous run's copy instead of re-downloading from scratch if
+        // it's still sitting at its deterministic temp path.
+        if (System.IO.File.Exists(tempFile))
+        {
+            if (_archiveExtractionService.IsArchiveIntact(tempFile))
+            {
+                AppendLog($"{task.DisplayName} was already downloaded earlier - reusing it instead of downloading again.");
+                var existingSize = new FileInfo(tempFile).Length;
+                task.ExpectedTotalBytes = task.BytesDownloaded = existingSize;
+                _componentDownloadedFiles[componentKey] = tempFile;
+                return true;
+            }
+
+            // Don't let the download below "resume" on top of corrupt/truncated bytes.
+            try { System.IO.File.Delete(tempFile); } catch { /* best-effort - a failed delete just means DownloadAsync overwrites it instead */ }
+        }
 
         var progress = new Progress<DownloadProgressInfo>(p =>
         {
@@ -1341,6 +1645,19 @@ public partial class MainWindow : Window
         {
             AppendLog($"Cannot extract {componentKey}: the downloaded file wasn't found.", LogLevel.Error);
             return false;
+        }
+
+        if (componentKey == "xv2ins-reg" && !downloadedFile.EndsWith(".reg", StringComparison.OrdinalIgnoreCase))
+        {
+            // Downloads are saved as "{componentKey}.download" with no
+            // extension - ShellExecute needs the real .reg extension to know
+            // to hand it to regedit rather than showing an "how do you want
+            // to open this file" prompt.
+            var regPath = downloadedFile + ".reg";
+            if (File.Exists(regPath)) File.Delete(regPath);
+            File.Copy(downloadedFile, regPath);
+            downloadedFile = regPath;
+            _componentDownloadedFiles[componentKey] = regPath;
         }
 
         var kind = _archiveExtractionService.DetectKind(downloadedFile);
@@ -1434,13 +1751,39 @@ public partial class MainWindow : Window
 
         try
         {
-            // Both XV2Patcher's and Revamp's archives wrap their real payload in a
-            // single top-level folder (e.g. "XV2Patcher_4.64/..."). Flatten that one
-            // level so the actual files land directly in the Modded root, rather than
-            // nesting them under an extra subfolder that XV2Patcher/Revamp never expect.
-            var effectiveSourceDir = FlattenSingleWrapperFolder(stagingDir);
+            if (componentKey == "xv2patcher")
+            {
+                // Confirmed via a real extraction log: XV2Patcher's archive is
+                // NOT "everything wrapped in one folder" like Revamp's - its
+                // root has several items (bin/, a "-- alternative dll --"
+                // choice, docs, a dev-only patcher_compiler_script/) alongside
+                // the actual payload in an "XV2PATCHER" subfolder (which
+                // itself is NOT flattened - xv2patcher.ini and Epatches/ stay
+                // nested under XV2PATCHER, matching where the game's injected
+                // DLL expects to find them). Only bin/ and XV2PATCHER/ are
+                // real install content; the rest is left alone rather than
+                // dumped into the game folder.
+                LogStagingStructure(stagingDir);
+                await Task.Run(() => InstallXv2PatcherSelectively(stagingDir, _settings.ModdedPath), token);
+            }
+            else
+            {
+                // Revamp's/XV2INS'/etc. archives wrap their real payload in a
+                // single top-level folder - flatten that one level so the
+                // actual files land directly in the Modded root.
+                var effectiveSourceDir = FlattenSingleWrapperFolder(stagingDir);
 
-            await Task.Run(() => MergeDirectory(effectiveSourceDir, _settings.ModdedPath), token);
+                // xv2ins-dcd's files specifically belong under data/ (that's
+                // where XV2Ins' own output normally lives), not the game root.
+                var targetDir = componentKey == "xv2ins-dcd"
+                    ? Path.Combine(_settings.ModdedPath, "data")
+                    : _settings.ModdedPath;
+
+                await Task.Run(() => MergeDirectory(effectiveSourceDir, targetDir), token);
+            }
+
+            if (componentKey == "xv2patcher" && !File.Exists(Xv2PatcherIniPath(_settings.ModdedPath)))
+                AppendLog($"xv2patcher.ini still isn't at '{Xv2PatcherIniPath(_settings.ModdedPath)}' after installing - see the staging folder listing above.", LogLevel.Error);
 
             if (componentKey == "revamp" && !IsRevampInstalledCorrectly(_settings.ModdedPath))
             {
@@ -1471,6 +1814,21 @@ public partial class MainWindow : Window
     /// re-creating that wrapper folder inside the destination. Otherwise returns
     /// <paramref name="dir"/> unchanged.
     /// </summary>
+    /// <summary>The one true location of xv2patcher.ini, kept in one place since it's checked from several spots.</summary>
+    private static string Xv2PatcherIniPath(string moddedPath) => Path.Combine(moddedPath, "XV2PATCHER", "xv2patcher.ini");
+
+    /// <summary>Copies only the two real-content folders from XV2Patcher's archive (bin/ merged into the game's bin/, XV2PATCHER/ copied as-is) and leaves everything else (docs, the alternative-dll choice, dev scripts) alone. See the comment at this method's call site for why.</summary>
+    private static void InstallXv2PatcherSelectively(string stagingDir, string moddedPath)
+    {
+        var binSource = Path.Combine(stagingDir, "bin");
+        if (Directory.Exists(binSource))
+            MergeDirectory(binSource, Path.Combine(moddedPath, "bin"));
+
+        var patcherSource = Path.Combine(stagingDir, "XV2PATCHER");
+        if (Directory.Exists(patcherSource))
+            MergeDirectory(patcherSource, Path.Combine(moddedPath, "XV2PATCHER"));
+    }
+
     private static string FlattenSingleWrapperFolder(string dir)
     {
         var entries = Directory.GetFileSystemEntries(dir);
@@ -1478,6 +1836,33 @@ public partial class MainWindow : Window
             return entries[0];
 
         return dir;
+    }
+
+    /// <summary>Logs the extracted folder's structure (up to 3 levels deep, capped at 60 lines) so a wrong "flatten" assumption is visible in the log instead of silently causing files to land somewhere unexpected.</summary>
+    private void LogStagingStructure(string dir)
+    {
+        var lines = new List<string>();
+        void Walk(string path, int depth)
+        {
+            if (depth > 3 || lines.Count >= 60) return;
+            foreach (var entry in Directory.GetFileSystemEntries(path))
+            {
+                var relative = Path.GetRelativePath(dir, entry);
+                var isDir = Directory.Exists(entry);
+                lines.Add($"{new string(' ', depth * 2)}{(isDir ? "[dir] " : "")}{relative}");
+                if (isDir) Walk(entry, depth + 1);
+            }
+        }
+
+        try
+        {
+            Walk(dir, 0);
+            AppendLog($"Staging folder structure:\n{string.Join('\n', lines)}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Couldn't list the staging folder structure: {ex.Message}", LogLevel.Warning);
+        }
     }
 
     /// <summary>
@@ -1627,6 +2012,7 @@ public partial class MainWindow : Window
 
         AppendLog("Update finished.");
         await LoadModsAsync();
+        await EnsureMandatoryModsInstalledAsync();
         await RunLaunchInspectAsync();
     }
 

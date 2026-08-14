@@ -9,7 +9,7 @@ public enum LauncherActivityState
     Paused
 }
 
-/// The three flags that must all be true for the "Run" button to be enabled.
+/// The flags that must all be true for the "Run" button to be enabled.
 
 public class InstallationStatus
 {
@@ -17,7 +17,10 @@ public class InstallationStatus
     public bool IsXv2PatcherUpToDate { get; set; }
     public bool IsRevampUpToDate { get; set; }
 
-    public bool CanRun => IsXenoverse2Installed && IsXv2PatcherUpToDate && IsRevampUpToDate;
+    /// <summary>True only if no mod (including Revamp Core) has NeedsUpdate - i.e. every mod recorded as enabled has actually been verified present on disk.</summary>
+    public bool AreAllModsUpToDate { get; set; } = true;
+
+    public bool CanRun => IsXenoverse2Installed && IsXv2PatcherUpToDate && IsRevampUpToDate && AreAllModsUpToDate;
 }
 
 public class VersionComparison

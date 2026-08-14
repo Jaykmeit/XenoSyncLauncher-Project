@@ -69,15 +69,25 @@ public class ModCatalogService
                 ? remote.DownloadUrls
                 : (remote.DownloadUrl is not null ? new List<string> { remote.DownloadUrl } : new List<string>());
 
-            // For XenoSyncCore, reflect whether it's actually been installed on
-            // this device yet (checked once it has real extracted files
-            // recorded) - it doesn't mean "optional, off by default" like it
-            // would for a normal mod; EnsureMandatoryModsInstalledAsync still
-            // installs it regardless of this flag, this only affects the
-            // checkbox display so it doesn't falsely show "installed" up front.
-            bool isActuallyInstalled = category == ModCategory.XenoSyncCore
+            // Don't just trust what mods.json says was installed - a Modded
+            // reinstall, manual cleanup, or a botched previous update could
+            // have wiped the actual files without the record ever being
+            // updated to reflect that. Verify every recorded file is still
+            // there; if it claims enabled but isn't verifiably so, that's a
+            // signal it needs a fresh Update/Reinstall (NeedsUpdate), not
+            // silent trust that it's actually working.
+            bool recordedEnabled = category == ModCategory.XenoSyncCore
                 ? existing is { RepositoryFolder: not null } && existing.InstalledRelativeFiles.Count > 0
                 : existing?.IsEnabled ?? false;
+
+            bool filesVerifiedPresent = recordedEnabled && existing is { InstalledRelativeFiles.Count: > 0 } &&
+                (moddedPath is null || existing.InstalledRelativeFiles.All(rel => System.IO.File.Exists(Path.Combine(moddedPath, rel))));
+
+            // Can't verify without knowing where to look - only flag a real
+            // mismatch, don't punish mods for moddedPath being unknown yet.
+            bool needsUpdate = recordedEnabled && moddedPath is not null && !filesVerifiedPresent;
+
+            bool isActuallyInstalled = recordedEnabled;
 
             result.Add(new ModRecord
             {
@@ -92,7 +102,8 @@ public class ModCatalogService
                 Category = category,
                 IsEnabled = isActuallyInstalled,
                 RepositoryFolder = existing?.RepositoryFolder,
-                InstalledRelativeFiles = existing?.InstalledRelativeFiles ?? new List<string>()
+                InstalledRelativeFiles = existing?.InstalledRelativeFiles ?? new List<string>(),
+                NeedsUpdate = needsUpdate
             });
         }
 
@@ -137,36 +148,64 @@ public class ModCatalogService
     {
         localById.TryGetValue("xv2-revamp-core", out var existing);
 
-        bool isActuallyInstalled = !string.IsNullOrWhiteSpace(moddedPath) &&
+        bool recordedInstalled = !string.IsNullOrWhiteSpace(moddedPath) &&
                                     _installedVersionService.GetInstalledRevampVersion(moddedPath) is not null;
+
+        // installed-versions.json is the launcher's own bookkeeping, written
+        // right after a successful install - it doesn't get updated if the
+        // files themselves later disappear (Modded reinstall, manual
+        // cleanup...). Verify the same key file used elsewhere to confirm a
+        // real Revamp install (see IsRevampInstalledCorrectly in MainWindow).
+        bool filesVerifiedPresent = recordedInstalled && !string.IsNullOrWhiteSpace(moddedPath) &&
+            System.IO.File.Exists(Path.Combine(moddedPath, "data", "LB Mod Installer", "revamp xenoverse 2 project_revamp team.xml"));
+
+        bool needsUpdate = recordedInstalled && !string.IsNullOrWhiteSpace(moddedPath) && !filesVerifiedPresent;
+        bool isActuallyInstalled = recordedInstalled;
 
         return new ModRecord
         {
             Id = "xv2-revamp-core",
             Title = "Xenoverse 2 Revamp",
             Description = "Core mod pack bundled with the Revamp installer. Always required by XenoSync Launcher.",
-            Author = "Project Revamp Team",
+            Author = "Revamp Team",
             PageUrl = "https://www.revampxv2.com/download",
+            // Curated from Revamp's official VideogameMods listing (videogamemods.com/.../revamp-xenoverse-2-project-v5-0-0-350530),
+            // hosted on VGM's own CDN - loads fine directly, no login/session required.
+            // Spread across the full 76-image gallery (not consecutive) for more variety in the slideshow.
+            ScreenshotUrls = new List<string>
+            {
+                "https://uploads.videogamemods.com/communities/the-citadel/mods/revamp-xenoverse-2-project-v5-0-0-350530-cf80dfa2-1255-40fe-8100-c2385c3387e4/images/0_a336004a.webp",
+                "https://uploads.videogamemods.com/communities/the-citadel/mods/revamp-xenoverse-2-project-v5-0-0-350530-cf80dfa2-1255-40fe-8100-c2385c3387e4/images/8_54887fa8.webp",
+                "https://uploads.videogamemods.com/communities/the-citadel/mods/revamp-xenoverse-2-project-v5-0-0-350530-cf80dfa2-1255-40fe-8100-c2385c3387e4/images/16_bf76a331.webp",
+                "https://uploads.videogamemods.com/communities/the-citadel/mods/revamp-xenoverse-2-project-v5-0-0-350530-cf80dfa2-1255-40fe-8100-c2385c3387e4/images/24_e1ff265f.webp",
+                "https://uploads.videogamemods.com/communities/the-citadel/mods/revamp-xenoverse-2-project-v5-0-0-350530-cf80dfa2-1255-40fe-8100-c2385c3387e4/images/32_468a01f5.webp",
+                "https://uploads.videogamemods.com/communities/the-citadel/mods/revamp-xenoverse-2-project-v5-0-0-350530-cf80dfa2-1255-40fe-8100-c2385c3387e4/images/40_d0d2cc42.webp",
+                "https://uploads.videogamemods.com/communities/the-citadel/mods/revamp-xenoverse-2-project-v5-0-0-350530-cf80dfa2-1255-40fe-8100-c2385c3387e4/images/48_7ad65ae7.webp",
+                "https://uploads.videogamemods.com/communities/the-citadel/mods/revamp-xenoverse-2-project-v5-0-0-350530-cf80dfa2-1255-40fe-8100-c2385c3387e4/images/56_fbb99e34.webp",
+                "https://uploads.videogamemods.com/communities/the-citadel/mods/revamp-xenoverse-2-project-v5-0-0-350530-cf80dfa2-1255-40fe-8100-c2385c3387e4/images/64_c31251b3.webp",
+                "https://uploads.videogamemods.com/communities/the-citadel/mods/revamp-xenoverse-2-project-v5-0-0-350530-cf80dfa2-1255-40fe-8100-c2385c3387e4/images/75_30b2c995.webp"
+            },
             Category = ModCategory.RevampCore,
             IsEnabled = isActuallyInstalled,
             RepositoryFolder = existing?.RepositoryFolder,
-            InstalledRelativeFiles = existing?.InstalledRelativeFiles ?? new List<string>()
+            InstalledRelativeFiles = existing?.InstalledRelativeFiles ?? new List<string>(),
+            NeedsUpdate = needsUpdate
         };
     }
 
     public void Save(List<ModRecord> mods)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(LocalStatePath)!);
-        File.WriteAllText(LocalStatePath, JsonSerializer.Serialize(mods, JsonOptions));
+        System.IO.File.WriteAllText(LocalStatePath, JsonSerializer.Serialize(mods, JsonOptions));
     }
 
     private static List<ModRecord> LoadLocalState()
     {
-        if (!File.Exists(LocalStatePath)) return new List<ModRecord>();
+        if (!System.IO.File.Exists(LocalStatePath)) return new List<ModRecord>();
 
         try
         {
-            return JsonSerializer.Deserialize<List<ModRecord>>(File.ReadAllText(LocalStatePath), JsonOptions) ?? new List<ModRecord>();
+            return JsonSerializer.Deserialize<List<ModRecord>>(System.IO.File.ReadAllText(LocalStatePath), JsonOptions) ?? new List<ModRecord>();
         }
         catch
         {
