@@ -24,7 +24,7 @@ public partial class QrLoginWindow : Window
     private const int ModuleWidthPerChar = ModuleHeight / 2;
 
     /// <summary>The character DepotDownloader's block-art decodes to for a dark module (see DepotDownloaderService remarks).</summary>
-    private const char DarkModuleChar = '�';
+    private const char DarkModuleChar = '\u00DB'; // 'Û', same value as QrDarkModuleChar
 
     public QrLoginWindow(string[] qrAsciiLines, Action onCancel)
     {

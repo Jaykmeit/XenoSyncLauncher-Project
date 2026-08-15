@@ -91,7 +91,8 @@ public class DepotDownloaderService
             RedirectStandardError = true,
             RedirectStandardInput = true,
             UseShellExecute = false,
-            CreateNoWindow = true
+            CreateNoWindow = true,
+            StandardOutputEncoding = System.Text.Encoding.Latin1 // forces 1 byte -> 1 char (0xDB -> 'Û')
         };
 
         using var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
