@@ -5,21 +5,51 @@
         Height="560" Width="820"
         WindowStartupLocation="CenterScreen"
         Background="{StaticResource BrushBackground}"
-        ResizeMode="NoResize">
+        ResizeMode="NoResize"
+        WindowStyle="None"
+        AllowsTransparency="False">
+
+    <WindowChrome.WindowChrome>
+        <WindowChrome CaptionHeight="32"
+                      ResizeBorderThickness="0"
+                      CornerRadius="0"
+                      GlassFrameThickness="0"
+                      UseAeroCaptionButtons="False"/>
+    </WindowChrome.WindowChrome>
+
     <Grid Margin="0">
         <Grid.RowDefinitions>
+            <RowDefinition Height="32"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="64"/>
         </Grid.RowDefinitions>
 
+        <!-- Barra de título personalizada -->
+        <Border Grid.Row="0" Background="{StaticResource BrushPanel}"
+                BorderBrush="{StaticResource BrushBorder}" BorderThickness="0,0,0,1">
+            <Grid>
+                <TextBlock Text="XenoSync Launcher - First Run Setup" Foreground="{StaticResource BrushTextPrimary}"
+                           FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center" Margin="14,0,0,0"/>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
+                            WindowChrome.IsHitTestVisibleInChrome="True">
+                    <Button x:Name="BtnMinimize" Content="&#xE921;"
+                            Style="{StaticResource TitleBarButtonStyle}" Click="BtnMinimize_Click"
+                            ToolTip="Minimizar"/>
+                    <Button x:Name="BtnClose" Content="&#xE8BB;"
+                            Style="{StaticResource TitleBarCloseButtonStyle}" Click="BtnClose_Click"
+                            ToolTip="Cerrar"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
         <!-- Contenedor de las páginas del wizard -->
         <Frame x:Name="WizardFrame"
-               Grid.Row="0"
+               Grid.Row="1"
                NavigationUIVisibility="Hidden"
                JournalOwnership="OwnsJournal"/>
 
         <!-- Barra inferior de navegación -->
-        <Border Grid.Row="1" Background="{StaticResource BrushPanel}" BorderBrush="{StaticResource BrushBorder}" BorderThickness="0,1,0,0">
+        <Border Grid.Row="2" Background="{StaticResource BrushPanel}" BorderBrush="{StaticResource BrushBorder}" BorderThickness="0,1,0,0">
             <Grid Margin="20,0">
                 <TextBlock x:Name="StepIndicatorText"
                            Text="Step 1 of 5"

@@ -2042,4 +2042,23 @@ public partial class MainWindow : Window
             AppendLog($"Failed to launch: {ex.Message}", LogLevel.Error);
         }
     }
+
+    private void BtnMinimize_Click(object sender, RoutedEventArgs e)
+    {
+        WindowState = WindowState.Minimized;
+    }
+
+    private void BtnMaximizeRestore_Click(object sender, RoutedEventArgs e)
+    {
+        WindowState = WindowState == WindowState.Maximized
+            ? WindowState.Normal
+            : WindowState.Maximized;
+
+        BtnMaximizeRestore.Content = WindowState == WindowState.Maximized ? "\uE923" : "\uE922";
+    }
+
+    private void BtnClose_Click(object sender, RoutedEventArgs e)
+    {
+        Close();
+    }
 }

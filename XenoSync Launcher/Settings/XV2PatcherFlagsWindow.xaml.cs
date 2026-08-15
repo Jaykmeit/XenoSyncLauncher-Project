@@ -67,4 +67,7 @@ public partial class XV2PatcherFlagsWindow : Window
         DialogResult = false;
         Close();
     }
+
+    /// <summary>Botón X de la barra de título personalizada: mismo comportamiento que Cancel.</summary>
+    private void BtnClose_Click(object sender, RoutedEventArgs e) => CancelButton_Click(sender, e);
 }

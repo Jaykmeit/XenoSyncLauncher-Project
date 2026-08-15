@@ -86,14 +86,20 @@ public partial class WizardWindow : Window
     private void CancelButton_Click(object sender, RoutedEventArgs e)
     {
         var result = MessageBox.Show(
-            "¿Seguro que quieres cancelar la configuración inicial? XenoSync Launcher se cerrará.",
-            "Cancelar configuración",
+            "ï¿½Seguro que quieres cancelar la configuraciï¿½n inicial? XenoSync Launcher se cerrarï¿½.",
+            "Cancelar configuraciï¿½n",
             MessageBoxButton.YesNo,
             MessageBoxImage.Question);
 
         if (result == MessageBoxResult.Yes)
             System.Windows.Application.Current.Shutdown();
     }
+
+    /// <summary>BotÃ³n de la barra de tÃ­tulo personalizada: minimizar la ventana.</summary>
+    private void BtnMinimize_Click(object sender, RoutedEventArgs e) => WindowState = WindowState.Minimized;
+
+    /// <summary>BotÃ³n X de la barra de tÃ­tulo personalizada: mismo comportamiento que Cancel (muestra la confirmaciÃ³n antes de cerrar).</summary>
+    private void BtnClose_Click(object sender, RoutedEventArgs e) => CancelButton_Click(sender, e);
 
     private async System.Threading.Tasks.Task FinishWizardAsync()
     {
@@ -115,7 +121,7 @@ public partial class WizardWindow : Window
 
         // Persistimos lo decidido durante el Wizard para que la ventana
         // principal del launcher (MainWindow, fase siguiente del proyecto)
-        // sepa dónde está el directorio Modded, el Vanilla, etc.
+        // sepa dï¿½nde estï¿½ el directorio Modded, el Vanilla, etc.
         var settingsService = new SettingsService();
         settingsService.Save(settingsService.FromWizardContext(_context));
 

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Linq;
 using System.Windows;
 using System.Windows.Media;
@@ -24,7 +24,7 @@ public partial class QrLoginWindow : Window
     private const int ModuleWidthPerChar = ModuleHeight / 2;
 
     /// <summary>The character DepotDownloader's block-art decodes to for a dark module (see DepotDownloaderService remarks).</summary>
-    private const char DarkModuleChar = '�';
+    private const char DarkModuleChar = '�';
 
     public QrLoginWindow(string[] qrAsciiLines, Action onCancel)
     {
@@ -93,4 +93,7 @@ public partial class QrLoginWindow : Window
         _onCancel();
         Close();
     }
+
+    /// <summary>Botón X de la barra de título personalizada: mismo comportamiento que Cancel (dispara _onCancel para detener el login/descarga en curso).</summary>
+    private void BtnClose_Click(object sender, RoutedEventArgs e) => CancelButton_Click(sender, e);
 }

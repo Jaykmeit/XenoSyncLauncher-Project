@@ -3,13 +3,84 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:XenoSyncLauncher.MainApp"
         xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         Title="XenoSync Launcher"
         Height="680" Width="1320"
+        MinHeight="500" MinWidth="900"
         WindowStartupLocation="CenterScreen"
+        WindowStyle="None"
+        AllowsTransparency="False"
+        ResizeMode="CanResize"
         Background="{StaticResource BrushBackground}">
+
+    <!-- WindowChrome se encarga del arrastre, el redimensionado y de que
+         Maximizar no tape la barra de tareas (el fallo típico de quitar
+         WindowStyle sin esto). CaptionHeight coincide con la altura de la
+         barra superior (56) para que toda esa franja sea arrastrable salvo
+         los controles marcados como IsHitTestVisibleInChrome. -->
+    <WindowChrome.WindowChrome>
+        <WindowChrome CaptionHeight="56"
+                      ResizeBorderThickness="6"
+                      CornerRadius="0"
+                      GlassFrameThickness="0"
+                      UseAeroCaptionButtons="False"/>
+    </WindowChrome.WindowChrome>
+
     <Window.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVis"/>
+
+        <!-- Botones de la barra de título: minimizar / maximizar -->
+        <Style x:Key="TitleBarButtonStyle" TargetType="Button">
+            <Setter Property="Width" Value="42"/>
+            <Setter Property="Height" Value="34"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="{StaticResource BrushTextSecondary}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="FontFamily" Value="Segoe MDL2 Assets"/>
+            <Setter Property="FontSize" Value="10"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bg" Background="{TemplateBinding Background}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bg" Property="Background" Value="{StaticResource BrushBorder}"/>
+                                <Setter Property="Foreground" Value="{StaticResource BrushTextPrimary}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Botón de cerrar: mismo patrón pero con el rojo que ya usas en BrushDanger -->
+        <Style x:Key="TitleBarCloseButtonStyle" TargetType="Button" BasedOn="{StaticResource TitleBarButtonStyle}">
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Foreground" Value="White"/>
+                </Trigger>
+            </Style.Triggers>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bg" Background="{TemplateBinding Background}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bg" Property="Background" Value="{StaticResource BrushDanger}"/>
+                                <Setter Property="Foreground" Value="White"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
     </Window.Resources>
+
     <Grid Margin="0">
         <Grid.RowDefinitions>
             <RowDefinition Height="56"/>
@@ -18,62 +89,90 @@
             <RowDefinition Height="70"/>
         </Grid.RowDefinitions>
 
-        <!-- Top bar: title, Live/Not Found indicator, Settings gear -->
+        <!-- Top bar: title, Live/Not Found indicator, Settings gear, controles de ventana -->
         <Border Grid.Row="0"
         Background="{StaticResource BrushPanel}"
         BorderBrush="{StaticResource BrushBorder}"
         BorderThickness="0,0,0,1">
 
-            <Grid Margin="20,0">
+            <Grid>
+                <!-- Contenido original, con su margen de 20px respecto a los bordes -->
+                <Grid Margin="20,0,0,0">
 
-                <Image Source="pack://application:,,,/XenoSyncLauncher;component/Assets/img/logo.png"
-                   Height="124"
-                   Stretch="Uniform"
-                   VerticalAlignment="Center"
-                   HorizontalAlignment="Left" Width="246"/>
-                <Border x:Name="LiveIndicatorBadge"
-                HorizontalAlignment="Center"
-                VerticalAlignment="Center"
-                Background="{StaticResource BrushPanel}"
-                BorderBrush="{StaticResource BrushBorder}"
-                BorderThickness="1"
-                CornerRadius="12"
-                Padding="12,4">
+                    <Image Source="pack://application:,,,/XenoSyncLauncher;component/Assets/img/logo.png"
+                       Height="96"
+                       Stretch="Uniform"
+                       VerticalAlignment="Top"
+                       HorizontalAlignment="Left" Width="235" Margin="-7,-24,0,0"/>
+                    <Border x:Name="LiveIndicatorBadge"
+                    HorizontalAlignment="Center"
+                    VerticalAlignment="Center"
+                    Background="{StaticResource BrushPanel}"
+                    BorderBrush="{StaticResource BrushBorder}"
+                    BorderThickness="1"
+                    CornerRadius="12"
+                    Padding="12,4">
 
-                    <StackPanel Orientation="Horizontal">
-                        <Ellipse x:Name="LiveIndicatorDot"
-                         Width="8"
-                         Height="8"
-                         Fill="{StaticResource BrushDanger}"
-                         Margin="0,0,8,0"/>
+                        <StackPanel Orientation="Horizontal">
+                            <Ellipse x:Name="LiveIndicatorDot"
+                             Width="8"
+                             Height="8"
+                             Fill="{StaticResource BrushDanger}"
+                             Margin="0,0,8,0"/>
 
-                        <TextBlock x:Name="LiveIndicatorText"
-                           Text="Not Found"
-                           Foreground="{StaticResource BrushTextPrimary}"
-                           FontSize="12"
-                           FontWeight="SemiBold"/>
-                    </StackPanel>
+                            <TextBlock x:Name="LiveIndicatorText"
+                               Text="Not Found"
+                               Foreground="{StaticResource BrushTextPrimary}"
+                               FontSize="12"
+                               FontWeight="SemiBold"/>
+                        </StackPanel>
 
-                </Border>
+                    </Border>
 
-                <TextBlock x:Name="LauncherVersionText"
-                   Text="v0.1"
-                   Foreground="{StaticResource BrushTextSecondary}"
-                   FontSize="11"
-                   VerticalAlignment="Center"
-                   HorizontalAlignment="Right"
-                   Margin="0,0,44,0"/>
+                    <TextBlock x:Name="LauncherVersionText"
+                       Text="v0.1"
+                       Foreground="{StaticResource BrushTextSecondary}"
+                       FontSize="11"
+                       VerticalAlignment="Center"
+                       HorizontalAlignment="Left"
+                       Margin="1109,0,0,0"/>
 
-                <Button x:Name="SettingsButton"
-                Content="&#9881;"
-                Width="36"
-                Height="36"
-                HorizontalAlignment="Right"
-                FontSize="16"
-                Style="{StaticResource WizardButton}"
-                Click="SettingsButton_Click"
-                ToolTip="Settings"/>
+                    <Button x:Name="SettingsButton"
+                    Content="&#9881;"
+                    Width="36"
+                    Height="36"
+                    HorizontalAlignment="Left"
+                    FontSize="16"
+                    Margin="1133,10,0,9"
+                    Style="{StaticResource WizardButton}"
+                    Click="SettingsButton_Click"
+                    ToolTip="Settings"
+                    WindowChrome.IsHitTestVisibleInChrome="True"/>
+                </Grid>
 
+                <!-- Controles de ventana: minimizar / maximizar-restaurar / cerrar,
+                     pegados a la esquina superior derecha, fuera del margen de 20px
+                     para que queden al borde como es habitual. -->
+                <StackPanel Orientation="Horizontal"
+                            HorizontalAlignment="Right"
+                            VerticalAlignment="Stretch"
+                            WindowChrome.IsHitTestVisibleInChrome="True">
+                    <Button x:Name="BtnMinimize"
+                            Content="&#xE921;"
+                            Style="{StaticResource TitleBarButtonStyle}"
+                            Click="BtnMinimize_Click"
+                            ToolTip="Minimizar"/>
+                    <Button x:Name="BtnMaximizeRestore"
+                            Content="&#xE922;"
+                            Style="{StaticResource TitleBarButtonStyle}"
+                            Click="BtnMaximizeRestore_Click"
+                            ToolTip="Maximizar"/>
+                    <Button x:Name="BtnClose"
+                            Content="&#xE8BB;"
+                            Style="{StaticResource TitleBarCloseButtonStyle}"
+                            Click="BtnClose_Click"
+                            ToolTip="Cerrar"/>
+                </StackPanel>
             </Grid>
         </Border>
         <!-- Main content: mod tree + details / Launch Inspect sidebar -->
