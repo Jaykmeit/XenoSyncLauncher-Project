@@ -10,6 +10,7 @@
 		<AssemblyName>XenoSyncLauncher</AssemblyName>
 		<ApplicationIcon></ApplicationIcon>
 		<LangVersion>latest</LangVersion>
+		<ApplicationIcon>Assets\icon.ico</ApplicationIcon>
 	</PropertyGroup>
 
 	<ItemGroup>
