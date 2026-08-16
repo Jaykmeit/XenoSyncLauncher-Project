@@ -343,13 +343,36 @@
                     <Button x:Name="CopyLogButton" Content="Copy Log" Width="80" Height="22" Padding="0" FontSize="10"
                             HorizontalAlignment="Right" Style="{StaticResource WizardButton}" Click="CopyLogButton_Click"/>
                 </Grid>
+                <!-- Each line is a read-only, borderless TextBox instead of a plain
+                     TextBlock: a TextBlock's content can't be mouse-selected at all,
+                     which left Copy Log as the only way to get anything out of the
+                     log. A read-only TextBox looks identical but supports normal
+                     click-drag selection and Ctrl+C per line/partial line. -->
                 <ListBox x:Name="LogListBox" Grid.Row="1" Background="Transparent" BorderThickness="0"
                          FontFamily="Consolas" FontSize="11">
                     <ListBox.ItemTemplate>
                         <DataTemplate>
-                            <TextBlock Text="{Binding Text}" Foreground="{Binding ForegroundBrush}" TextWrapping="Wrap"/>
+                            <TextBox Text="{Binding Text, Mode=OneWay}"
+                                     Foreground="{Binding ForegroundBrush}"
+                                     Background="Transparent"
+                                     BorderThickness="0"
+                                     IsReadOnly="True"
+                                     IsReadOnlyCaretVisible="True"
+                                     TextWrapping="Wrap"
+                                     Cursor="IBeam"
+                                     Padding="0"
+                                     FontFamily="Consolas"
+                                     FontSize="11"
+                                     SelectionBrush="{StaticResource BrushAccent}"/>
                         </DataTemplate>
                     </ListBox.ItemTemplate>
+                    <ListBox.ItemContainerStyle>
+                        <Style TargetType="ListBoxItem">
+                            <Setter Property="Focusable" Value="False"/>
+                            <Setter Property="Padding" Value="0"/>
+                            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                        </Style>
+                    </ListBox.ItemContainerStyle>
                 </ListBox>
             </Grid>
         </Border>

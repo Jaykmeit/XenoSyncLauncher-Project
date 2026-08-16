@@ -75,4 +75,21 @@ public class WizardContext
 
     /// <summary>Path chosen (or auto-installed) for DepotDownloader.exe, set by DepotDownloaderSetupPage.</summary>
     public string? DepotDownloaderPath { get; set; }
+
+    /// <summary>
+    /// Steam account name used for the DepotDownloader login prompt
+    /// (Credentials method only), configured on DepotDownloaderSetupPage
+    /// during the Wizard. Left null when SteamLoginMethod is "QrCode".
+    /// </summary>
+    public string? SteamUsername { get; set; }
+
+    /// <summary>
+    /// "QrCode" (default, recommended) or "Credentials" - chosen on
+    /// DepotDownloaderSetupPage during the Wizard, mirroring the same
+    /// setting available later in Settings. Configuring it up front means
+    /// the very first real Update (which may need to run DepotDownloader)
+    /// doesn't silently fall back to the QrCode default before the user
+    /// has had a chance to visit Settings.
+    /// </summary>
+    public string SteamLoginMethod { get; set; } = "QrCode";
 }

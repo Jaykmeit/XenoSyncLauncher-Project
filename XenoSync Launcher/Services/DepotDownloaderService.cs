@@ -50,6 +50,16 @@ public class DepotDownloadResult
 ///    interactive password / Steam Guard prompts via the supplied async
 ///    callbacks, writing the response to stdin. Nothing is persisted to disk
 ///    by XenoSync Launcher itself either way.
+///
+/// Both login methods also pass "-remember-password", which tells
+/// DepotDownloader itself (not XenoSync Launcher) to cache the resulting
+/// login locally so a later invocation can sign in silently. This matters
+/// because Pause kills the DepotDownloader process outright (see the
+/// cancellationToken registration in RunAsync) and Resume starts a brand new
+/// one - without a cached login, that fresh process has nothing to reuse and
+/// re-prompts from scratch every time, which for QR meant re-scanning a code
+/// on every single Pause/Resume cycle even though the user had already
+/// signed in once in the same session.
 /// </summary>
 public class DepotDownloaderService
 {
@@ -143,8 +153,16 @@ public class DepotDownloaderService
         if (!string.IsNullOrWhiteSpace(request.DepotId))
             args += $" -depot {request.DepotId}";
 
+        // -remember-password tells DepotDownloader to cache the login
+        // locally so a later run can sign in silently. This must be passed
+        // for BOTH login methods, not just Credentials: Pause kills the
+        // DepotDownloader process outright (see RunAsync's cancellationToken
+        // registration), and Resume launches a brand new process - without
+        // this flag on the QR branch, that fresh process has no cached
+        // session at all and re-prompts for a full QR scan on every single
+        // Pause/Resume cycle, even though the user already signed in once.
         args += request.LoginMethod == SteamLoginMethod.QrCode
-            ? " -qr"
+            ? " -qr -remember-password"
             : $" -username {request.SteamUsername} -remember-password";
 
         return args;

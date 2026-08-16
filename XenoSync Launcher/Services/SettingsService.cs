@@ -92,7 +92,14 @@ public class SettingsService
             InstallType = ctx.InstallType.ToString(),
             NeedsGameDownload = needsGameDownload,
             RequiredManifestId = needsGameDownload ? ctx.RevampSupportedVersion?.ManifestId : null,
-            DepotDownloaderPath = ctx.DepotDownloaderPath
+            DepotDownloaderPath = ctx.DepotDownloaderPath,
+            // Carried over from DepotDownloaderSetupPage so the very first
+            // real Update (which is what actually runs DepotDownloader)
+            // already has the login method the user picked during the
+            // Wizard, instead of silently falling back to the QrCode
+            // default with no username until Settings is visited manually.
+            SteamUsername = ctx.SteamUsername,
+            SteamLoginMethod = ctx.SteamLoginMethod
         };
     }
 }

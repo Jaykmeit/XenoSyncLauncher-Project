@@ -51,6 +51,24 @@ public partial class MainWindow : Window
     private readonly System.Windows.Data.CollectionViewSource _modsView = new();
     private readonly ObservableCollection<LogEntry> _logLines = new();
 
+    /// <summary>
+    /// Hard cap on how many log lines are kept in memory/UI at once. Without
+    /// this, a session with several DepotDownloader reconnects/stalls (each
+    /// one appending many lines) leaves the log growing without bound, which
+    /// makes every subsequent AppendLog/ScrollIntoView and every "Copy Log"
+    /// progressively more expensive. Oldest lines are dropped first.
+    /// </summary>
+    private const int MaxLogLines = 1000;
+
+    /// <summary>
+    /// Coalesces ScrollIntoView calls: a whole burst of AppendLog calls that
+    /// arrive back-to-back (e.g. a wave of "[DepotDownloader] ..." lines
+    /// during a Steam reconnect) triggers at most one scroll, scheduled once
+    /// the UI thread is otherwise idle, instead of one expensive layout pass
+    /// per line.
+    /// </summary>
+    private bool _logScrollPending;
+
     private bool _webViewInitAttempted;
     private bool _webViewReady;
     private string? _pagePreviewLoadedUrl;
@@ -409,24 +427,90 @@ public partial class MainWindow : Window
     /// stall-watchdog, which runs inside Task.Run) without this check crashes
     /// with "An ItemsControl is inconsistent with its items source" once the
     /// mismatch accumulates enough to trip WPF's internal generator check.
+    ///
+    /// Two things were changed here to fix the app appearing to "freeze" when
+    /// clicking Copy Log right after a burst of DepotDownloader activity
+    /// (repeated reconnects / the 20-second stall warning, both of which can
+    /// call AppendLog many times in quick succession, some from a background
+    /// thread):
+    ///   1. Background-thread calls are marshalled at DispatcherPriority.Background
+    ///      instead of the default Normal priority, so a burst of log updates
+    ///      doesn't compete with (and effectively block, from the user's
+    ///      perspective) UI interactions like a button click, which are also
+    ///      processed through the dispatcher queue.
+    ///   2. The list is capped at MaxLogLines and ScrollIntoView is coalesced
+    ///      to at most once per burst (via ContextIdle), instead of once per
+    ///      line - both of which get significantly more expensive the longer
+    ///      an unbounded log grows across repeated reconnects over a session.
     /// </summary>
     private void AppendLog(string message, LogLevel level = LogLevel.Info)
     {
         if (!Dispatcher.CheckAccess())
         {
-            Dispatcher.BeginInvoke(() => AppendLog(message, level));
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() => AppendLog(message, level)));
             return;
         }
 
-        var entry = new LogEntry { Text = $"[{DateTime.Now:HH:mm:ss}] {message}", Level = level };
-        _logLines.Add(entry);
-        LogListBox.ScrollIntoView(entry);
+        _logLines.Add(new LogEntry { Text = $"[{DateTime.Now:HH:mm:ss}] {message}", Level = level });
+
+        while (_logLines.Count > MaxLogLines)
+            _logLines.RemoveAt(0);
+
+        if (!_logScrollPending)
+        {
+            _logScrollPending = true;
+            Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, new Action(() =>
+            {
+                _logScrollPending = false;
+                if (_logLines.Count > 0) LogListBox.ScrollIntoView(_logLines[^1]);
+            }));
+        }
     }
 
-    private void CopyLogButton_Click(object sender, RoutedEventArgs e)
+    /// <summary>
+    /// OpenClipboard (which Clipboard.SetText relies on internally) fails
+    /// with CLIPBRD_E_CANT_OPEN whenever another process holds the clipboard
+    /// open - a clipboard manager, Windows' own clipboard history (Win+V),
+    /// an RDP session bridging the clipboard, antivirus inspection, etc.
+    /// This can outlast a handful of short retries, so this uses increasing
+    /// backoff (150ms, 300ms, 450ms, ... up to ~3s total across attempts)
+    /// via Task.Delay instead of Thread.Sleep, so the UI thread stays
+    /// responsive to everything else (including a burst of AppendLog calls)
+    /// while it retries.
+    /// </summary>
+    private async void CopyLogButton_Click(object sender, RoutedEventArgs e)
     {
-        System.Windows.Clipboard.SetText(string.Join(Environment.NewLine, _logLines.Select(l => l.Text)));
-        AppendLog("Log copied to clipboard.");
+        var text = string.Join(Environment.NewLine, _logLines.Select(l => l.Text));
+
+        CopyLogButton.IsEnabled = false;
+        try
+        {
+            const int maxAttempts = 12;
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    System.Windows.Clipboard.SetText(text);
+                    AppendLog("Log copied to clipboard.");
+                    return;
+                }
+                catch (System.Runtime.InteropServices.COMException) when (attempt < maxAttempts)
+                {
+                    await Task.Delay(150 * attempt);
+                }
+                catch (System.Runtime.InteropServices.COMException ex)
+                {
+                    AppendLog($"Couldn't copy the log to the clipboard after {maxAttempts} attempts: {ex.Message}. " +
+                              "Something else is holding the clipboard open for longer than usual - check for a clipboard " +
+                              "manager, Windows' Clipboard History (Win+V), or an active Remote Desktop session, then try again.",
+                              LogLevel.Warning);
+                }
+            }
+        }
+        finally
+        {
+            CopyLogButton.IsEnabled = true;
+        }
     }
 
     private void ExpandToggle_Click(object sender, RoutedEventArgs e)
