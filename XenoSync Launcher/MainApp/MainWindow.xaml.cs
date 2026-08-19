@@ -355,6 +355,38 @@ public partial class MainWindow : Window
         {
             var trackedManifestId = _installedVersionService.GetInstalledGameManifestId(_settings.ModdedPath);
             installedVersion = trackedManifestId is not null ? new VersionInfo { ManifestId = trackedManifestId } : null;
+
+            // Diagnostic only - doesn't change the decision below. If no
+            // tracked manifest was found but the actual game binary is
+            // already sitting right there in the Modded folder, that's a
+            // strong sign the real problem isn't "the game genuinely needs
+            // downloading" but "XenoSync's own bookkeeping (installed-versions.json,
+            // written only once the game-download task fully completes)
+            // never got recorded" - e.g. the app was closed/killed mid-download
+            // before that write happened, or this Modded folder's files were
+            // moved/copied in from elsewhere without going through XenoSync
+            // Launcher's own DepotDownloader-driven flow. Re-running
+            // DepotDownloader against an already-complete/near-complete set
+            // of files is harmless (it mostly just re-validates), but
+            // shouldn't be silently mistaken for "nothing was ever
+            // downloaded" without a trace in the log explaining why.
+            if (trackedManifestId is null)
+            {
+                var gameBinaryExists = File.Exists(Path.Combine(_settings.ModdedPath, "bin", "DBXV2.exe"));
+
+                if (gameBinaryExists)
+                {
+                    var bookkeepingPath = Path.Combine(_settings.ModdedPath, "XenoSync", "installed-versions.json");
+                    var bookkeepingExists = File.Exists(bookkeepingPath);
+
+                    AppendLog($"Game version check: no tracked manifest found for this Modded folder, but 'bin\\DBXV2.exe' is already " +
+                              $"present ({(bookkeepingExists ? $"'{bookkeepingPath}' exists but has no GameManifestId recorded" : $"'{bookkeepingPath}' doesn't exist")}). " +
+                              "DepotDownloader will likely just re-validate already-correct files rather than download from scratch, but " +
+                              "if this keeps happening on every Update, this Modded folder's files may have been moved/copied in from " +
+                              "elsewhere without going through XenoSync Launcher, or a previous Update was closed before it finished recording success.",
+                              LogLevel.Warning);
+                }
+            }
         }
 
         var revampRequiredVersion = await _versionCheckService.GetRevampSupportedVersionAsync();
@@ -1237,13 +1269,35 @@ public partial class MainWindow : Window
             // it has no concept of an individual mod needing reinstalling, so
             // that's handled explicitly here instead (this is still part of
             // the Update flow, just the no-op-for-those-three-components path).
-            await LoadModsAsync();
-            await EnsureMandatoryModsInstalledAsync();
-            await RunLaunchInspectAsync();
+            //
+            // _activityState MUST be tracked here too, even though this branch
+            // never touches the task-pipeline UI: AutoUpdateTimer_TickAsync's
+            // only guard against starting a second, overlapping Update is
+            // "_activityState != Idle". EnsureMandatoryModsInstalledAsync can
+            // run for a long time when a mod needs a self-extracting installer
+            // the user has to click through (e.g. Night Conton City's
+            // "Halloween in Conton City.exe") - if this branch left
+            // _activityState at Idle the whole time, a 30-minute Auto-Update
+            // tick firing mid-install would start a SECOND overlapping call to
+            // EnsureMandatoryModsInstalledAsync, and both would race to
+            // extract into the same deterministic %TEMP% path at once -
+            // exactly the "being used by another process" IOException seen
+            // when the app was left running unattended overnight.
+            _activityState = LauncherActivityState.Updating;
+            try
+            {
+                await LoadModsAsync();
+                await EnsureMandatoryModsInstalledAsync();
+                await RunLaunchInspectAsync();
 
-            AppendLog(_status.AreAllModsUpToDate
-                ? "Nothing to update — all components are already at the latest version."
-                : "XV2Patcher/Revamp/XV2INS are up to date, but some mods still couldn't be reinstalled — check the log above for details.");
+                AppendLog(_status.AreAllModsUpToDate
+                    ? "Nothing to update — all components are already at the latest version."
+                    : "XV2Patcher/Revamp/XV2INS are up to date, but some mods still couldn't be reinstalled — check the log above for details.");
+            }
+            finally
+            {
+                _activityState = LauncherActivityState.Idle;
+            }
             return;
         }
 
@@ -1309,7 +1363,30 @@ public partial class MainWindow : Window
             bool completed = await RunSingleTaskAsync(task, _updateCts.Token);
 
             if (!completed)
-                return; // paused or cancelled during login — state is preserved for next time
+            {
+                // Two of the three ways RunSingleTaskAsync can return false
+                // already reset the UI themselves before getting here:
+                // PauseResumeButton_Click sets _activityState = Paused (and
+                // shows "Resume") before cancelling for a user-initiated
+                // Pause, and StopUpdateEntirely already sets _activityState
+                // = Idle (and restores Update/Run) for a cancelled login. In
+                // BOTH of those cases _activityState is no longer Updating
+                // by the time we get here, so there's nothing left to do.
+                //
+                // A genuine task failure (network error, a verification
+                // check like Revamp's key-file check failing, etc.) is
+                // different: nothing else touches _activityState for that
+                // case, so without this check it stayed at Updating forever
+                // - Pause/Run stayed hidden, the progress bars stayed
+                // visible showing a task that had already stopped running,
+                // and Pause had nothing left to actually cancel. This is
+                // exactly the "process is left waiting forever" behavior
+                // reported after Revamp's install verification failed.
+                if (_activityState == LauncherActivityState.Updating)
+                    StopUpdateEntirely($"Update stopped: {task.DisplayName} failed. Check the log above for details, then try Update again.", LogLevel.Error);
+
+                return;
+            }
 
             task.IsCompleted = true;
 
@@ -1399,6 +1476,18 @@ public partial class MainWindow : Window
                 // an unrecognized prompt (different wording than we expect)
                 // just sits there silently instead of giving anyone a clue.
                 AppendLog($"[DepotDownloader] {p.StatusLine}");
+
+                // If the credential window is still open, it means a password
+                // (or Steam Guard code) was already submitted and is showing
+                // a static "Verifying..." - without this, that message never
+                // changes until either a repeated prompt or the process's
+                // eventual exit, even if DepotDownloader is actively
+                // reporting what's really happening (retrying, connecting,
+                // or an outright login failure worded differently than the
+                // repeatable-prompt patterns this app recognizes). Mirror
+                // whatever DepotDownloader just printed into the window
+                // itself so the person isn't staring at a frozen message.
+                _credentialPromptWindow?.SetStatus(p.StatusLine);
             }
         });
 
@@ -1452,6 +1541,41 @@ public partial class MainWindow : Window
             }
         });
 
+        // DepotDownloader's own printed percentage (fed into task.RealTimeProgressPercent
+        // above) applies per-file, not to the whole depot - a large file
+        // starting fresh right after a small one finishes restarts its own
+        // 0-100% cycle, which can look "stuck" or even step backward for a
+        // while even though real progress is happening. This instead tracks
+        // actual bytes written to disk under the Modded folder, which is
+        // immune to that and only ever grows. Baseline is captured now
+        // (before the process starts) so BytesDownloaded reflects what's
+        // been added THIS run - note that also means it starts back at 0
+        // after every Pause/Resume cycle (each is a fresh process/fresh
+        // RunRealDepotTaskAsync call), rather than accumulating across them;
+        // it's still always accurate for "how much has this session pulled
+        // down so far", just not a running total spanning multiple pauses.
+        var byteTrackingBaseline = await Task.Run(() => ComputeDirectoryByteSize(_settings.ModdedPath), CancellationToken.None);
+
+        using var byteTrackingCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var byteTrackingTask = Task.Run(async () =>
+        {
+            try
+            {
+                while (true)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(5), byteTrackingCts.Token);
+
+                    var currentTotal = ComputeDirectoryByteSize(_settings.ModdedPath);
+                    task.BytesDownloaded = Math.Max(0, currentTotal - byteTrackingBaseline);
+                    RefreshUpdateProgressUi();
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Normal: cancelled once the download finishes/pauses.
+            }
+        });
+
         var result = await _depotDownloaderService.RunAsync(
             _settings.DepotDownloaderPath,
             request,
@@ -1463,6 +1587,9 @@ public partial class MainWindow : Window
 
         stallWatchdogCts.Cancel();
         try { await watchdogTask; } catch (OperationCanceledException) { }
+
+        byteTrackingCts.Cancel();
+        try { await byteTrackingTask; } catch (OperationCanceledException) { }
 
         _qrLoginWindow?.Close();
         _qrLoginWindow = null;
@@ -1503,6 +1630,8 @@ public partial class MainWindow : Window
 
         UpdateStatusPanel.Visibility = Visibility.Collapsed;
         UpdateProgressBar.Visibility = Visibility.Collapsed;
+        UpdateBytesText.Visibility = Visibility.Collapsed;
+        GameDownloadStatusPanel.Visibility = Visibility.Collapsed;
         PauseResumeButton.Visibility = Visibility.Collapsed;
         UpdateButton.Visibility = Visibility.Visible;
         RunButton.Visibility = Visibility.Visible;
@@ -1601,6 +1730,7 @@ public partial class MainWindow : Window
             "install-xv2ins" => await RunInstallTaskAsync("xv2ins", token),
             "install-xv2ins-dcd" => await RunInstallTaskAsync("xv2ins-dcd", token),
             "install-xv2ins-reg" => await RunInstallTaskAsync("xv2ins-reg", token),
+            "run-xv2ins-first-launch" => await RunXv2InsFirstLaunchAsync(token),
             _ => await SimulateTaskAsync(task, token)
         };
     }
@@ -1723,6 +1853,76 @@ public partial class MainWindow : Window
     /// it and waits for the user to complete it, since guessing silent-install
     /// flags for an unknown installer would be unreliable.
     /// </summary>
+    /// <summary>
+    /// Shell-executes an installer .exe (with a short retry loop for the
+    /// transient "still being scanned by antivirus" case right after a
+    /// download/extraction) and waits for the user to close it. Shared by
+    /// RunExtractOrLaunchTaskAsync's generic "this looks like an installer"
+    /// branch and RunInstallTaskAsync's Revamp-specific installer check, so
+    /// both behave identically instead of maintaining two copies of the same
+    /// retry/wait logic.
+    /// </summary>
+    private async Task<(bool Success, string? ErrorMessage)> LaunchAndWaitAsync(string exePath, string? workingDirectory, CancellationToken token)
+    {
+        const int maxLaunchAttempts = 3;
+        Process? process = null;
+
+        for (int attempt = 1; attempt <= maxLaunchAttempts; attempt++)
+        {
+            try
+            {
+                process = Process.Start(new ProcessStartInfo(exePath)
+                {
+                    UseShellExecute = true,
+                    WorkingDirectory = workingDirectory
+                });
+                break;
+            }
+            catch (Exception ex) when (attempt < maxLaunchAttempts)
+            {
+                // A file that was just downloaded/copied/extracted moments ago
+                // can still be transiently locked by antivirus real-time
+                // scanning the very first time something tries to ShellExecute
+                // it - the OS then reports it as if the process simply
+                // couldn't start. Retrying a couple of times with a short
+                // pause is enough for the scan to finish, without making the
+                // user restart the launcher just to hit the exact same file
+                // that's already scanned and cached as safe by then.
+                AppendLog($"Couldn't launch '{Path.GetFileName(exePath)}' yet ({ex.Message}). " +
+                          "It may still be getting scanned - retrying...", LogLevel.Warning);
+                await Task.Delay(1000, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                return (false, $"after {maxLaunchAttempts} attempts: {ex.Message}");
+            }
+        }
+
+        if (process is null)
+            return (false, "the process could not be started.");
+
+        try
+        {
+            using (process)
+            {
+                await using var registration = token.Register(() =>
+                {
+                    try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { /* ignore */ }
+                });
+
+                await process.WaitForExitAsync(CancellationToken.None);
+
+                if (token.IsCancellationRequested) return (false, "Cancelled");
+            }
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+
+        return (true, null);
+    }
+
     private async Task<bool> RunExtractOrLaunchTaskAsync(string componentKey, CancellationToken token)
     {
         if (!_componentDownloadedFiles.TryGetValue(componentKey, out var downloadedFile) || !File.Exists(downloadedFile))
@@ -1731,17 +1931,49 @@ public partial class MainWindow : Window
             return false;
         }
 
-        if (componentKey == "xv2ins-reg" && !downloadedFile.EndsWith(".reg", StringComparison.OrdinalIgnoreCase))
+        // x2i7394.tmp.reg (the hosted file this "download" step fetches) is a
+        // static, hand-authored .reg that hardcodes the maintainer's own test
+        // install path ("C:\Program Files (x86)\Steam\...\DB Xenoverse 2 REVAMP").
+        // Importing it as-is only produces a correct .x2m association for a
+        // user whose Modded folder happens to be at that exact path - for
+        // every other Modded path (i.e. virtually everyone), XV2INS's own
+        // first real run notices the mismatch between where it's actually
+        // running from and what got registered, and shows a blocking
+        // "XV2 Installer has noticed a change in the installer path...
+        // register again?" dialog our unattended pipeline has no way to
+        // answer - which can silently stall an entire background Update.
+        // Rather than import the downloaded file's content at all, write the
+        // same registry keys directly using THIS install's real ModdedPath
+        // (see X2mRegistryAssociationService.RegisterAssociation), so the
+        // association is correct from the very first run regardless of
+        // where the user's Modded folder is.
+        if (componentKey == "xv2ins-reg")
         {
-            // Downloads are saved as "{componentKey}.download" with no
-            // extension - ShellExecute needs the real .reg extension to know
-            // to hand it to regedit rather than showing an "how do you want
-            // to open this file" prompt.
-            var regPath = downloadedFile + ".reg";
-            if (File.Exists(regPath)) File.Delete(regPath);
-            File.Copy(downloadedFile, regPath);
-            downloadedFile = regPath;
-            _componentDownloadedFiles[componentKey] = regPath;
+            if (_settings?.ModdedPath is null)
+            {
+                AppendLog("Cannot register the .x2m file association: Modded path is not set.", LogLevel.Error);
+                return false;
+            }
+
+            try
+            {
+                X2mRegistryAssociationService.RegisterAssociation(_settings.ModdedPath);
+                AppendLog("Registered the .x2m file association for this install's actual Modded folder.");
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"Failed to register the .x2m file association: {ex.Message}", LogLevel.Error);
+                return false;
+            }
+
+            // Nothing was extracted/placed by this step - the association is
+            // written directly to the registry, not to any file under
+            // ModdedPath - so there's nothing for RunInstallTaskAsync to
+            // merge afterward. Empty staging dir mirrors the same
+            // "an installer already placed its own files" signal the
+            // launched-.exe branch below uses for that reason.
+            _componentStagingDirs[componentKey] = string.Empty;
+            return true;
         }
 
         var kind = _archiveExtractionService.DetectKind(downloadedFile);
@@ -1751,27 +1983,18 @@ public partial class MainWindow : Window
             AppendLog($"'{Path.GetFileName(downloadedFile)}' looks like an installer rather than a plain archive. " +
                       "Launching it now — please complete the installer, then XenoSync Launcher will continue automatically once it closes.");
 
-            try
+            // WorkingDirectory is set explicitly to the file's own folder.
+            // Leaving it unset falls back to Environment.CurrentDirectory -
+            // wherever the launcher's own .exe happens to have been run from
+            // (e.g. an arbitrary Downloads\... extraction folder), which has
+            // nothing to do with this freshly-downloaded file and isn't
+            // guaranteed to still exist.
+            var workingDirectory = Path.GetDirectoryName(downloadedFile);
+
+            var (launched, launchError) = await LaunchAndWaitAsync(downloadedFile, workingDirectory, token);
+            if (!launched)
             {
-                using var process = Process.Start(new ProcessStartInfo(downloadedFile) { UseShellExecute = true });
-                if (process is null)
-                {
-                    AppendLog("Failed to launch the installer.");
-                    return false;
-                }
-
-                await using var registration = token.Register(() =>
-                {
-                    try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { /* ignore */ }
-                });
-
-                await process.WaitForExitAsync(CancellationToken.None);
-
-                if (token.IsCancellationRequested) return false;
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"Failed to run the installer: {ex.Message}", LogLevel.Error);
+                AppendLog($"Failed to run the installer: {launchError}", LogLevel.Error);
                 return false;
             }
 
@@ -1807,6 +2030,78 @@ public partial class MainWindow : Window
     /// additionally confirmed via its key file (see IsRevampInstalledCorrectly)
     /// before being recorded - the process exiting isn't proof by itself.
     /// </summary>
+    /// <summary>
+    /// Launches XV2INS.exe with no arguments, once - its own dedicated Update
+    /// task, and the only point in the whole pipeline where XV2INS is
+    /// actually EXECUTED (as opposed to merely copied to disk by
+    /// "install-xv2ins", or having a .reg imported by "install-xv2ins-reg").
+    /// See UpdateTaskPlanner.AddXv2InsPrerequisiteTasks for why this matters:
+    /// without it, XV2INS's first real run didn't happen until a mod needed
+    /// installing via the X2M path, by which point Revamp had already been
+    /// downloaded and installed.
+    ///
+    /// WorkingDirectory is set to the Modded folder, matching every other
+    /// place this codebase launches XV2INS for real (see
+    /// ModInstallService.InstallViaX2mAsync/InstallX2mGroupAsync) - if XV2INS
+    /// resolves anything relative to "where am I running from", this keeps
+    /// that consistent with its real, later invocations.
+    ///
+    /// Like Revamp's own self-extracting installer (see
+    /// RunExtractOrLaunchTaskAsync), this waits for the person to close
+    /// XV2INS's own window themselves - there's no known silent/no-UI flag
+    /// to rely on instead, and guessing at one risks silently doing nothing.
+    /// </summary>
+    private async Task<bool> RunXv2InsFirstLaunchAsync(CancellationToken token)
+    {
+        if (_settings?.ModdedPath is null)
+        {
+            AppendLog("Cannot run XV2INS: Modded path is not configured.", LogLevel.Error);
+            return false;
+        }
+
+        var xv2insPath = Path.Combine(_settings.ModdedPath, "XV2INS.exe");
+        if (!File.Exists(xv2insPath))
+        {
+            AppendLog($"Cannot run XV2INS: '{xv2insPath}' wasn't found - the previous install step may not have completed.", LogLevel.Error);
+            return false;
+        }
+
+        AppendLog("Launching XV2INS for the first time so it can initialize itself against this Modded folder - " +
+                  "please close it once it's done, and XenoSync Launcher will continue automatically.");
+
+        try
+        {
+            using var process = Process.Start(new ProcessStartInfo(xv2insPath)
+            {
+                UseShellExecute = true,
+                WorkingDirectory = _settings.ModdedPath
+            });
+
+            if (process is null)
+            {
+                AppendLog("Failed to launch XV2INS.");
+                return false;
+            }
+
+            await using var registration = token.Register(() =>
+            {
+                try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { /* ignore */ }
+            });
+
+            await process.WaitForExitAsync(CancellationToken.None);
+
+            if (token.IsCancellationRequested) return false;
+
+            AppendLog("XV2INS closed.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Failed to run XV2INS: {ex.Message}", LogLevel.Error);
+            return false;
+        }
+    }
+
     private async Task<bool> RunInstallTaskAsync(string componentKey, CancellationToken token)
     {
         if (_settings?.ModdedPath is null) return false;
@@ -1835,6 +2130,8 @@ public partial class MainWindow : Window
 
         try
         {
+            string? revampEffectiveSourceDir = null;
+
             if (componentKey == "xv2patcher")
             {
                 // Confirmed via a real extraction log: XV2Patcher's archive is
@@ -1856,6 +2153,43 @@ public partial class MainWindow : Window
                 // single top-level folder - flatten that one level so the
                 // actual files land directly in the Modded root.
                 var effectiveSourceDir = FlattenSingleWrapperFolder(stagingDir);
+                if (componentKey == "revamp") revampEffectiveSourceDir = effectiveSourceDir;
+
+                if (componentKey == "revamp")
+                {
+                    // Revamp's distributed file has always been genuinely
+                    // ambiguous (its distributor calls it an "installer", but
+                    // whether it's actually a self-extracting .exe or a plain
+                    // archive wasn't confirmed - see RunExtractOrLaunchTaskAsync's
+                    // ArchiveKind.Unknown branch, which only launches it
+                    // directly when SharpCompress can't even open it as an
+                    // archive at all). If DetectKind instead sees it as a
+                    // genuine ZIP/RAR, this branch runs and the file gets
+                    // extracted as plain data - but if a real installer .exe
+                    // is sitting at the top level of that extracted content,
+                    // its own install logic (which may do more than just
+                    // place files - registry entries, other setup) never
+                    // actually runs, matching the reported "Revamp downloads
+                    // but nothing ever launches" behavior. Detect and run it
+                    // here first, the same way a mod's own installer .exe is
+                    // run (see ModInstallService.InstallViaExecutableAsync),
+                    // before merging anything - IsRevampInstalledCorrectly
+                    // below still verifies the result either way, regardless
+                    // of which of these two paths actually placed the files.
+                    var installerExe = Directory.GetFiles(effectiveSourceDir, "*.exe", SearchOption.TopDirectoryOnly).FirstOrDefault();
+                    if (installerExe is not null)
+                    {
+                        AppendLog($"Running Revamp's installer: {Path.GetFileName(installerExe)}... " +
+                                  "please complete it, then XenoSync Launcher will continue automatically once it closes.");
+
+                        var (installerLaunched, installerError) = await LaunchAndWaitAsync(installerExe, Path.GetDirectoryName(installerExe), token);
+                        if (!installerLaunched)
+                        {
+                            AppendLog($"Failed to run Revamp's installer: {installerError}", LogLevel.Error);
+                            return false;
+                        }
+                    }
+                }
 
                 // xv2ins-dcd's files specifically belong under data/ (that's
                 // where XV2Ins' own output normally lives), not the game root.
@@ -1871,9 +2205,41 @@ public partial class MainWindow : Window
 
             if (componentKey == "revamp" && !IsRevampInstalledCorrectly(_settings.ModdedPath))
             {
-                AppendLog("Revamp's key file (data/LB Mod Installer/revamp xenoverse 2 project_revamp team.xml) " +
-                          "wasn't found after copying its files. The install did not complete correctly.", LogLevel.Error);
-                return false;
+                // Fallback: the top-level-only search above may have missed
+                // the real installer if it's nested a folder or two deeper,
+                // or if Revamp's archive layout has simply changed since this
+                // was last checked. Search the whole extracted tree this time
+                // and, if something turns up, actually run it before giving
+                // up outright - this is exactly the "when this happens, make
+                // sure to run the XV2 Revamp Launcher installer" behavior
+                // that was asked for.
+                AppendLog("Revamp's key file (data/LB Mod Installer/revamp xenoverse 2 project_revamp team.xml) wasn't found after " +
+                          "copying its files. Searching more broadly for an installer to run as a fallback...", LogLevel.Warning);
+
+                var fallbackInstaller = revampEffectiveSourceDir is not null
+                    ? Directory.GetFiles(revampEffectiveSourceDir, "*.exe", SearchOption.AllDirectories).FirstOrDefault()
+                    : null;
+
+                if (fallbackInstaller is null)
+                {
+                    AppendLog("No installer .exe was found anywhere in Revamp's extracted files either. The install did not complete correctly.", LogLevel.Error);
+                    return false;
+                }
+
+                AppendLog($"Found '{Path.GetFileName(fallbackInstaller)}' - running it now... please complete it, then " +
+                          "XenoSync Launcher will continue automatically once it closes.");
+
+                var (fallbackLaunched, fallbackError) = await LaunchAndWaitAsync(fallbackInstaller, Path.GetDirectoryName(fallbackInstaller), token);
+
+                if (!fallbackLaunched || !IsRevampInstalledCorrectly(_settings.ModdedPath))
+                {
+                    AppendLog(fallbackLaunched
+                        ? "Revamp's key file still wasn't found after running the fallback installer. The install did not complete correctly."
+                        : $"Failed to run the fallback installer: {fallbackError}", LogLevel.Error);
+                    return false;
+                }
+
+                AppendLog("Revamp's key file was found after running the fallback installer.");
             }
 
             RecordInstalledVersion(componentKey);
@@ -2082,6 +2448,106 @@ public partial class MainWindow : Window
         UpdateTaskText.Text = currentTask is not null
             ? $"{currentTask.PhaseLabel} {currentTask.DisplayName}... ({completedCount}/{_updateTasks.Count} tasks done)"
             : $"{completedCount}/{_updateTasks.Count} tasks done";
+
+        // Real byte counts for the currently-running component download
+        // (XV2Patcher/Revamp/XV2INS/etc.) - these come straight from
+        // HttpDownloadService/GoogleDriveDownloadService's own reported
+        // BytesReceived/TotalBytes, so unlike the game-download case below
+        // there's nothing to estimate or poll: just format what's already
+        // being tracked accurately. Only shown for an actual Download-phase
+        // task with a known byte count (not the simulated Extract/Install
+        // "SubTicks" phases, which have no byte concept at all).
+        if (currentTask is { IsRealDepotDownload: false, Phase: UpdatePhase.Download } && currentTask.ExpectedTotalBytes > 0)
+        {
+            UpdateBytesText.Text = $"{FormatBytes(currentTask.BytesDownloaded)} / {FormatBytes(currentTask.ExpectedTotalBytes)}";
+            UpdateBytesText.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            UpdateBytesText.Visibility = Visibility.Collapsed;
+        }
+
+        // Dedicated bar for the real DepotDownloader task: the overall bar
+        // above only allocates it an equal 1/N share among every planned
+        // task regardless of how large the actual game download is - with
+        // e.g. 16 planned tasks total, that's just ~6% of the whole bar, so
+        // a multi-GB download can look "stuck" near that low overall
+        // percentage for a long time even while genuinely progressing. This
+        // second bar shows DepotDownloader's own live 0-100% directly.
+        if (currentTask is { IsRealDepotDownload: true })
+        {
+            GameDownloadStatusPanel.Visibility = Visibility.Visible;
+            var gamePercent = Math.Clamp(currentTask.RealTimeProgressPercent, 0, 100);
+            GameDownloadProgressBar.Value = gamePercent;
+            GameDownloadPercentText.Text = $"{gamePercent:0.0}%";
+
+            // DepotDownloader's own printed percentage applies per-file, not
+            // to the whole depot - a huge file starting fresh after a small
+            // one finishes can make the number above plateau or even step
+            // backward-looking for a while even though real progress is
+            // happening. currentTask.BytesDownloaded is instead kept updated
+            // by a filesystem poll (see StartGameDownloadByteTracking) that
+            // sums actual bytes written under the Modded folder since this
+            // task started - immune to that per-file reset, and always
+            // strictly increasing. No total is shown since DepotDownloader
+            // doesn't expose the depot's overall size to us.
+            GameDownloadBytesText.Text = currentTask.BytesDownloaded > 0
+                ? $"{FormatBytes(currentTask.BytesDownloaded)} downloaded so far"
+                : string.Empty;
+        }
+        else
+        {
+            GameDownloadStatusPanel.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    /// <summary>Formats a byte count as "512 MB"/"1.82 GB"-style text, matching the granularity most useful at each size.</summary>
+    private static string FormatBytes(long bytes)
+    {
+        const double kb = 1024, mb = kb * 1024, gb = mb * 1024;
+
+        return bytes switch
+        {
+            >= (long)gb => $"{bytes / gb:0.00} GB",
+            >= (long)mb => $"{bytes / mb:0.0} MB",
+            >= (long)kb => $"{bytes / kb:0} KB",
+            _ => $"{bytes} B"
+        };
+    }
+
+    /// <summary>
+    /// Sums the size of every file under a directory tree. Used to poll real,
+    /// filesystem-level download progress during a DepotDownloader run,
+    /// independent of DepotDownloader's own printed percentage (which
+    /// applies per-file rather than to the whole depot - see the byte
+    /// tracking remarks in RunRealDepotTaskAsync). Deliberately tolerant of
+    /// individual files disappearing/being renamed mid-enumeration (which
+    /// DepotDownloader itself can legitimately do while this runs on a
+    /// background thread) - such a file is just skipped rather than failing
+    /// the whole scan.
+    /// </summary>
+    private static long ComputeDirectoryByteSize(string path)
+    {
+        if (!Directory.Exists(path)) return 0;
+
+        long total = 0;
+        IEnumerable<string> files;
+        try
+        {
+            files = Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories);
+        }
+        catch
+        {
+            return 0;
+        }
+
+        foreach (var file in files)
+        {
+            try { total += new FileInfo(file).Length; }
+            catch { /* deleted/renamed mid-scan, or a transient access issue - skip it, not fatal */ }
+        }
+
+        return total;
     }
 
     private async Task FinishUpdateAsync()
@@ -2090,6 +2556,8 @@ public partial class MainWindow : Window
 
         UpdateStatusPanel.Visibility = Visibility.Collapsed;
         UpdateProgressBar.Visibility = Visibility.Collapsed;
+        UpdateBytesText.Visibility = Visibility.Collapsed;
+        GameDownloadStatusPanel.Visibility = Visibility.Collapsed;
         PauseResumeButton.Visibility = Visibility.Collapsed;
         UpdateButton.Visibility = Visibility.Visible;
         RunButton.Visibility = Visibility.Visible;

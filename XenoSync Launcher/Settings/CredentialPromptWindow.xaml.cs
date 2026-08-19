@@ -56,6 +56,28 @@ public partial class CredentialPromptWindow : Window
         field.Focus();
     }
 
+    /// <summary>
+    /// Updates the status line shown while a submitted credential is being
+    /// checked, WITHOUT re-enabling input or treating it as an error -
+    /// intended to be called as DepotDownloader keeps printing output after
+    /// a password/code was sent to it. Before this existed, the window just
+    /// showed a static "Verifying..." with zero feedback from the moment
+    /// Continue was clicked until DepotDownloader either succeeded, re-asked
+    /// for the same credential, or the whole process eventually exited/timed
+    /// out - meaning any failure DepotDownloader reported in a form we don't
+    /// treat as a repeatable prompt (e.g. a login error phrased differently
+    /// than expected) was silently swallowed into the background log while
+    /// this window sat frozen. Calling this with DepotDownloader's own
+    /// output line instead lets the person see live what's actually
+    /// happening (connecting, retrying, or the real failure reason) instead
+    /// of an unmoving generic message.
+    /// </summary>
+    public void SetStatus(string text)
+    {
+        StatusText.Text = text;
+        StatusText.Visibility = Visibility.Visible;
+    }
+
     private void SetInputEnabled(bool enabled)
     {
         ValuePasswordBox.IsEnabled = enabled;
@@ -69,6 +91,7 @@ public partial class CredentialPromptWindow : Window
 
         SetInputEnabled(false);
         ErrorText.Visibility = Visibility.Collapsed;
+        StatusText.Text = "Verifying...";
         StatusText.Visibility = Visibility.Visible;
 
         _pendingSubmit?.TrySetResult(value);

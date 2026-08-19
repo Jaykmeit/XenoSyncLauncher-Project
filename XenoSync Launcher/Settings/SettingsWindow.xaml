@@ -42,71 +42,79 @@
                 <RowDefinition Height="50"/>
             </Grid.RowDefinitions>
 
-            <StackPanel Grid.Row="0">
-                <TextBlock Text="Settings" Foreground="{StaticResource BrushTextPrimary}" FontSize="20" FontWeight="Bold" Margin="0,0,0,20"/>
+            <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
+                <StackPanel>
+                    <TextBlock Text="Settings" Foreground="{StaticResource BrushTextPrimary}" FontSize="20" FontWeight="Bold" Margin="0,0,0,20"/>
 
-                <TextBlock Text="Vanilla folder" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,6"/>
-                <Grid Margin="0,0,0,16">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <TextBox x:Name="VanillaPathTextBox" Grid.Column="0" Height="30" Padding="8,4"
+                    <TextBlock Text="Vanilla folder" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,6"/>
+                    <Grid Margin="0,0,0,16">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="VanillaPathTextBox" Grid.Column="0" Height="30" Padding="8,4"
                              Background="{StaticResource BrushPanel}" Foreground="{StaticResource BrushTextPrimary}"
                              BorderBrush="{StaticResource BrushBorder}" IsReadOnly="True"/>
-                    <Button x:Name="BrowseVanillaButton" Grid.Column="1" Content="Browse..." Width="100" Margin="10,0,0,0"
+                        <Button x:Name="BrowseVanillaButton" Grid.Column="1" Content="Browse..." Width="100" Margin="10,0,0,0"
                             Style="{StaticResource WizardButton}" Click="BrowseVanillaButton_Click"/>
-                </Grid>
+                    </Grid>
 
-                <TextBlock Text="Modded folder" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,6"/>
-                <Grid Margin="0,0,0,16">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <TextBox x:Name="ModdedPathTextBox" Grid.Column="0" Height="30" Padding="8,4"
+                    <TextBlock Text="Modded folder" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,6"/>
+                    <Grid Margin="0,0,0,16">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="ModdedPathTextBox" Grid.Column="0" Height="30" Padding="8,4"
                              Background="{StaticResource BrushPanel}" Foreground="{StaticResource BrushTextPrimary}"
                              BorderBrush="{StaticResource BrushBorder}" IsReadOnly="True"/>
-                    <Button x:Name="BrowseModdedButton" Grid.Column="1" Content="Browse..." Width="100" Margin="10,0,0,0"
+                        <Button x:Name="BrowseModdedButton" Grid.Column="1" Content="Browse..." Width="100" Margin="10,0,0,0"
                             Style="{StaticResource WizardButton}" Click="BrowseModdedButton_Click"/>
-                </Grid>
+                    </Grid>
 
-                <TextBlock Text="Download speed limit (Mbps)" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,6"/>
-                <TextBox x:Name="SpeedLimitTextBox" Height="30" Width="120" HorizontalAlignment="Left" Padding="8,4"
+                    <TextBlock Text="Download speed limit (Mbps)" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,6"/>
+                    <TextBox x:Name="SpeedLimitTextBox" Height="30" Width="120" HorizontalAlignment="Left" Padding="8,4"
                          Background="{StaticResource BrushPanel}" Foreground="{StaticResource BrushTextPrimary}"
                          BorderBrush="{StaticResource BrushBorder}" Margin="0,0,0,0"/>
-                <TextBlock Text="0 = Unlimited" Foreground="{StaticResource BrushTextSecondary}" FontSize="10" FontWeight="SemiBold" Margin="0,0,0,16"/>
+                    <TextBlock Text="0 = Unlimited" Foreground="{StaticResource BrushTextSecondary}" FontSize="10" FontWeight="SemiBold" Margin="0,0,0,16"/>
 
-                <CheckBox x:Name="AutoUpdateCheckBox" Content="Auto-Update (install new Revamp versions automatically)"
+                    <CheckBox x:Name="AutoUpdateCheckBox" Content="Auto-Update (install new Revamp versions automatically)"
                           Foreground="{StaticResource BrushTextPrimary}" FontSize="13" Margin="0,0,0,16"/>
 
-                <TextBlock Text="DepotDownloader.exe path" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,6"/>
-                <Grid Margin="0,0,0,16">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <TextBox x:Name="DepotDownloaderPathTextBox" Grid.Column="0" Height="30" Padding="8,4"
+                    <TextBlock Text="DepotDownloader.exe path" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,6"/>
+                    <Grid Margin="0,0,0,16">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="DepotDownloaderPathTextBox" Grid.Column="0" Height="30" Padding="8,4"
                              Background="{StaticResource BrushPanel}" Foreground="{StaticResource BrushTextPrimary}"
                              BorderBrush="{StaticResource BrushBorder}" IsReadOnly="True"/>
-                    <Button x:Name="BrowseDepotDownloaderButton" Grid.Column="1" Content="Browse..." Width="100" Margin="10,0,0,0"
+                        <Button x:Name="BrowseDepotDownloaderButton" Grid.Column="1" Content="Browse..." Width="100" Margin="10,0,0,0"
                             Style="{StaticResource WizardButton}" Click="BrowseDepotDownloaderButton_Click"/>
-                </Grid>
+                    </Grid>
 
-                <TextBlock Text="Steam username (for DepotDownloader sign-in)" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,6"/>
-                <TextBox x:Name="SteamUsernameTextBox" Height="30" Padding="8,4"
+                    <TextBlock Text="Steam username (for DepotDownloader sign-in)" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,6"/>
+                    <TextBox x:Name="SteamUsernameTextBox" Height="30" Padding="8,4"
                          Background="{StaticResource BrushPanel}" Foreground="{StaticResource BrushTextPrimary}"
                          BorderBrush="{StaticResource BrushBorder}" Margin="0,0,0,16"/>
 
-                <TextBlock Text="Steam login method for downloads" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,6"/>
-                <RadioButton x:Name="QrLoginRadio" GroupName="LoginMethod" Content="QR code (recommended - scan with the Steam mobile app)"
+                    <TextBlock Text="Steam login method for downloads" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,6"/>
+                    <RadioButton x:Name="QrLoginRadio" GroupName="LoginMethod" Content="QR code (recommended - scan with the Steam mobile app)"
                              Foreground="{StaticResource BrushTextPrimary}" FontSize="13" Margin="0,0,0,4"/>
-                <RadioButton x:Name="CredentialsLoginRadio" GroupName="LoginMethod" Content="Username &amp; password (typed in this window when needed)"
+                    <RadioButton x:Name="CredentialsLoginRadio" GroupName="LoginMethod" Content="Username &amp; password (typed in this window when needed)"
                              Foreground="{StaticResource BrushTextPrimary}" FontSize="13"/>
 
-                <!-- TODO (next step): DInput/XInput swap checkbox, xv2patcher.ini flags list
-                     with hover descriptions, and the "Repair" button. -->
-            </StackPanel>
+                    <TextBlock Text="XV2Patcher Flags" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" Margin="0,20,0,6"/>
+                    <TextBlock Foreground="{StaticResource BrushTextSecondary}" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,10">
+                    Opens the advanced xv2patcher.ini flags editor for the Modded folder set above.
+                    </TextBlock>
+                    <Button x:Name="XV2PatcherFlagsButton" Content="XV2 Patcher Flags..." Width="180" HorizontalAlignment="Left"
+                        Style="{StaticResource WizardButton}" Click="XV2PatcherFlagsButton_Click" Margin="0,0,0,16"/>
+
+                    <!-- TODO (next step): DInput/XInput swap checkbox and the "Repair" button. -->
+                </StackPanel>
+            </ScrollViewer>
 
             <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Bottom">
                 <Button x:Name="CancelButton" Content="Cancel" Height="25" Width="100" Margin="0,0,10,0"

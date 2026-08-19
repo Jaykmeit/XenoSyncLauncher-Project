@@ -40,6 +40,16 @@ public class ModCatalogService
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
+    /// <summary>
+    /// Same layout ModInstallService.RepositoryFolderFor uses: where a mod's
+    /// extracted files live, inside the Modded folder itself rather than a
+    /// launcher-private AppData cache. Duplicated here (rather than shared)
+    /// since ModInstallService's copy is private - kept as a one-line combine
+    /// so there's nothing meaningful to actually get out of sync between them.
+    /// </summary>
+    private static string RepositoryFolderFor(string moddedPath, string modId) =>
+        Path.Combine(moddedPath, "XenoSync", "DownloadedMods", modId);
+
     public async Task<List<ModRecord>> LoadAsync(string? moddedPath = null)
     {
         var localById = LoadLocalState().ToDictionary(m => m.Id);
@@ -80,6 +90,36 @@ public class ModCatalogService
                 ? existing is { RepositoryFolder: not null } && existing.InstalledRelativeFiles.Count > 0
                 : existing?.IsEnabled ?? false;
 
+            // mods.json lives under %APPDATA% - tied to this Windows profile,
+            // not to the Modded folder itself. A mod's extracted repository
+            // copy, on the other hand, lives INSIDE the Modded folder at
+            // "<ModdedPath>/XenoSync/DownloadedMods/<id>" - so it travels
+            // with the Modded folder even when mods.json doesn't (a new
+            // Windows profile/machine, AppData getting cleared, or the
+            // Modded folder being copied/moved elsewhere all desync
+            // mods.json from reality without touching this). Without this
+            // check, such a mod would permanently show as "not installed"
+            // despite its files plainly being present on disk - this is the
+            // "no me marca que estén instalados algunos mods" report.
+            var repositoryFolder = existing?.RepositoryFolder ?? (moddedPath is not null ? RepositoryFolderFor(moddedPath, remote.Id) : null);
+            bool repositoryFolderExistsOnDisk = repositoryFolder is not null && Directory.Exists(repositoryFolder);
+
+            if (!recordedEnabled && repositoryFolderExistsOnDisk)
+            {
+                // We now know the mod's raw extracted files are there, but
+                // mods.json has no record of which relative paths were
+                // actually copied into the Modded folder itself - flipping
+                // straight to IsEnabled=true with an empty
+                // InstalledRelativeFiles would make Disable()/Uninstall a
+                // silent no-op later. Instead: show it as installed (checkbox
+                // checked) but flagged NeedsUpdate, so Update or
+                // EnsureMandatoryModsInstalledAsync re-runs
+                // InstallExtractedModAsync against this already-extracted
+                // repository folder (no re-download needed) to properly
+                // (re)populate InstalledRelativeFiles.
+                recordedEnabled = true;
+            }
+
             bool filesVerifiedPresent = recordedEnabled && existing is { InstalledRelativeFiles.Count: > 0 } &&
                 (moddedPath is null || existing.InstalledRelativeFiles.All(rel => System.IO.File.Exists(Path.Combine(moddedPath, rel))));
 
@@ -101,7 +141,7 @@ public class ModCatalogService
                 ParentId = remote.Parent,
                 Category = category,
                 IsEnabled = isActuallyInstalled,
-                RepositoryFolder = existing?.RepositoryFolder,
+                RepositoryFolder = existing?.RepositoryFolder ?? (repositoryFolderExistsOnDisk ? repositoryFolder : null),
                 InstalledRelativeFiles = existing?.InstalledRelativeFiles ?? new List<string>(),
                 NeedsUpdate = needsUpdate
             });
@@ -156,6 +196,12 @@ public class ModCatalogService
         // files themselves later disappear (Modded reinstall, manual
         // cleanup...). Verify the same key file used elsewhere to confirm a
         // real Revamp install (see IsRevampInstalledCorrectly in MainWindow).
+        //
+        // Unlike Optional/XenoSyncCore mods, this doesn't suffer from the
+        // mods.json-vs-ModdedPath desync described above: installed-versions.json
+        // already lives INSIDE the Modded folder (at "<ModdedPath>/XenoSync/"),
+        // so it travels with it the same way RepositoryFolder does - no
+        // separate on-disk existence check is needed here.
         bool filesVerifiedPresent = recordedInstalled && !string.IsNullOrWhiteSpace(moddedPath) &&
             System.IO.File.Exists(Path.Combine(moddedPath, "data", "LB Mod Installer", "revamp xenoverse 2 project_revamp team.xml"));
 

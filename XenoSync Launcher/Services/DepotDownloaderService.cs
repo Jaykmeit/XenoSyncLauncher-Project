@@ -60,6 +60,18 @@ public class DepotDownloadResult
 /// re-prompts from scratch every time, which for QR meant re-scanning a code
 /// on every single Pause/Resume cycle even though the user had already
 /// signed in once in the same session.
+///
+/// Output parsing also treats a bare '\r' (carriage return with no '\n') as
+/// its own line boundary, not just '\n'. DepotDownloader prints per-file
+/// "Validating ..." messages one per real line, but once it starts actually
+/// downloading changed bytes it switches to an in-place progress percentage
+/// that rewrites the same console line via '\r' only. Without recognizing a
+/// bare '\r' as a boundary, that text just accumulates unseen: the progress
+/// percentage never reaches HandleChunkAsync (so the UI progress bar visibly
+/// freezes at whatever the last real newline-terminated line reported), and
+/// the stall watchdog - which only resets its timer from inside the progress
+/// callback - fires repeated false "no output in 20 seconds" warnings even
+/// though DepotDownloader is actively downloading the whole time.
 /// </summary>
 public class DepotDownloaderService
 {
@@ -231,11 +243,32 @@ public class DepotDownloaderService
 
             pending.Append(buffer, 0, read);
 
-            int newlineIndex;
-            while ((newlineIndex = IndexOfNewline(pending)) >= 0)
+            int boundaryIndex;
+            while ((boundaryIndex = IndexOfLineBoundary(pending)) >= 0)
             {
-                var line = pending.ToString(0, newlineIndex).TrimEnd('\r');
-                pending.Remove(0, newlineIndex + 1);
+                var boundaryChar = pending[boundaryIndex];
+                var line = pending.ToString(0, boundaryIndex);
+
+                var removeLength = boundaryIndex + 1;
+                // A lone '\r' followed immediately by '\n' is a normal Windows
+                // line ending - swallow both as a single boundary. A '\r' NOT
+                // followed by '\n' (yet, or ever) is an in-place progress-bar
+                // update, which DepotDownloader uses once it moves from
+                // per-file "Validating ..." lines (each terminated with a real
+                // '\n') to a live download percentage that rewrites the same
+                // console line. Without treating a bare '\r' as its own
+                // boundary, those updates just accumulate here forever: the
+                // percentage never reaches HandleChunkAsync, so the progress
+                // bar visibly freezes and the stall watchdog (which only
+                // resets its timer inside the progress callback) fires
+                // "no output in 20 seconds" repeatedly even though
+                // DepotDownloader is actively downloading the whole time.
+                if (boundaryChar == '\r' && removeLength < pending.Length && pending[removeLength] == '\n')
+                    removeLength++;
+
+                pending.Remove(0, removeLength);
+
+                if (line.Length == 0) continue; // the leftover '\n' half of a \r\n we already consumed, or a bare repeated '\r'
 
                 if (!await ProcessLineAsync(line))
                     return;
@@ -273,10 +306,15 @@ public class DepotDownloaderService
     private static bool IsQrArtLine(string line) =>
         line.Length > 20 && line.Contains(QrDarkModuleChar) && line.All(c => c == QrDarkModuleChar || c == ' ');
 
-    private static int IndexOfNewline(StringBuilder buffer)
+    /// <summary>
+    /// Index of the first '\n' or '\r' in the buffer, whichever comes first -
+    /// either can terminate a "line" worth processing. See the call site in
+    /// ReadStreamAsync for why a bare '\r' matters (in-place progress bars).
+    /// </summary>
+    private static int IndexOfLineBoundary(StringBuilder buffer)
     {
         for (int i = 0; i < buffer.Length; i++)
-            if (buffer[i] == '\n') return i;
+            if (buffer[i] == '\n' || buffer[i] == '\r') return i;
         return -1;
     }
 
