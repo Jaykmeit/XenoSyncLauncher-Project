@@ -48,4 +48,6 @@ public class RemoteVersionMap
     /// be a genuinely public direct link that doesn't need a login session.
     /// </summary>
     public string? RevampFallbackDownloadUrl { get; set; }
+
+    public long? RequiredDepotSizeBytes { get; set; }
 }

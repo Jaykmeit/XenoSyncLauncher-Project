@@ -50,6 +50,7 @@ public class UpdateTaskItem
 
     /// Set live from DepotDownloaderService's IProgress callback (0..100), used instead of ExpectedTotalBytes/BytesDownloaded.
     public double RealTimeProgressPercent { get; set; }
+    public double CurrentSpeedBytesPerSecond { get; set; }
 
     /// Fraction (0..1) of this specific task's completion, used to compute smooth overall progress.
     public double FractionComplete

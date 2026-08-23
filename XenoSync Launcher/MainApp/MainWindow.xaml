@@ -86,7 +86,7 @@
             <RowDefinition Height="56"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="150"/>
-            <RowDefinition Height="95"/>
+            <RowDefinition Height="135"/>
         </Grid.RowDefinitions>
 
         <!-- Top bar: title, Live/Not Found indicator, Settings gear, controles de ventana -->
@@ -348,32 +348,13 @@
                      which left Copy Log as the only way to get anything out of the
                      log. A read-only TextBox looks identical but supports normal
                      click-drag selection and Ctrl+C per line/partial line. -->
-                <ListBox x:Name="LogListBox" Grid.Row="1" Background="Transparent" BorderThickness="0"
-                         FontFamily="Consolas" FontSize="11">
-                    <ListBox.ItemTemplate>
-                        <DataTemplate>
-                            <TextBox Text="{Binding Text, Mode=OneWay}"
-                                     Foreground="{Binding ForegroundBrush}"
-                                     Background="Transparent"
-                                     BorderThickness="0"
-                                     IsReadOnly="True"
-                                     IsReadOnlyCaretVisible="True"
-                                     TextWrapping="Wrap"
-                                     Cursor="IBeam"
-                                     Padding="0"
-                                     FontFamily="Consolas"
-                                     FontSize="11"
-                                     SelectionBrush="{StaticResource BrushAccent}"/>
-                        </DataTemplate>
-                    </ListBox.ItemTemplate>
-                    <ListBox.ItemContainerStyle>
-                        <Style TargetType="ListBoxItem">
-                            <Setter Property="Focusable" Value="False"/>
-                            <Setter Property="Padding" Value="0"/>
-                            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
-                        </Style>
-                    </ListBox.ItemContainerStyle>
-                </ListBox>
+                <RichTextBox x:Name="LogRichTextBox" Grid.Row="1" Background="Transparent" BorderThickness="0"
+             FontFamily="Consolas" FontSize="11"
+             IsReadOnly="True" IsReadOnlyCaretVisible="True"
+             VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+             SelectionBrush="{StaticResource BrushAccent}">
+                    <FlowDocument PagePadding="0" TextAlignment="Left" FontFamily="Consolas" FontSize="11"/>
+                </RichTextBox>
             </Grid>
         </Border>
 

@@ -19,6 +19,8 @@ using Microsoft.Web.WebView2.Core;
 using XenoSyncLauncher.Models;
 using XenoSyncLauncher.Services;
 using XenoSyncLauncher.Settings;
+using System.Net.Http;
+using System.Text.RegularExpressions;
 
 namespace XenoSyncLauncher.MainApp;
 
@@ -33,6 +35,7 @@ public partial class MainWindow : Window
     private readonly UpdateTaskPlanner _updateTaskPlanner = new();
     private readonly DownloadResumeService _downloadResumeService = new();
     private readonly DepotDownloaderService _depotDownloaderService = new();
+    private readonly DepotSizeCacheService _depotSizeCacheService = new();
     private readonly DllSwapService _dllSwapService = new();
     private readonly IniFlagService _iniFlagService = new();
     private readonly HttpDownloadService _httpDownloadService = new();
@@ -58,7 +61,7 @@ public partial class MainWindow : Window
     /// makes every subsequent AppendLog/ScrollIntoView and every "Copy Log"
     /// progressively more expensive. Oldest lines are dropped first.
     /// </summary>
-    private const int MaxLogLines = 1000;
+    private const int MaxLogLines = 5000;
 
     /// <summary>
     /// Coalesces ScrollIntoView calls: a whole burst of AppendLog calls that
@@ -126,6 +129,8 @@ public partial class MainWindow : Window
     private const long SimulatedBytesPerTick = 10_000_000; // 10 MB per tick
     private static readonly TimeSpan SimulatedTickInterval = TimeSpan.FromMilliseconds(200);
 
+    private static readonly Regex PerFilePercentLinePattern = new(@"^\s*(\d{1,3}(?:\.\d+)?)%\s+(.+)$", RegexOptions.Compiled);
+
     public MainWindow()
     {
         InitializeComponent();
@@ -136,7 +141,7 @@ public partial class MainWindow : Window
         _modsView.Source = _mods;
         _modsView.GroupDescriptions.Add(new System.Windows.Data.PropertyGroupDescription(nameof(ModEntry.CategoryGroupName)));
         ModListBox.ItemsSource = _modsView.View;
-        LogListBox.ItemsSource = _logLines;
+        //LogListBox.ItemsSource = _logLines;
 
         Loaded += MainWindow_Loaded;
         Closing += MainWindow_Closing;
@@ -483,10 +488,22 @@ public partial class MainWindow : Window
             return;
         }
 
-        _logLines.Add(new LogEntry { Text = $"[{DateTime.Now:HH:mm:ss}] {message}", Level = level });
+        var entry = new LogEntry { Text = $"[{DateTime.Now:HH:mm:ss}] {message}", Level = level };
+        _logLines.Add(entry);
+
+        var paragraph = new System.Windows.Documents.Paragraph(new System.Windows.Documents.Run(entry.Text))
+        {
+            Margin = new Thickness(0),
+            Foreground = entry.ForegroundBrush
+        };
+        LogRichTextBox.Document.Blocks.Add(paragraph);
 
         while (_logLines.Count > MaxLogLines)
+        {
             _logLines.RemoveAt(0);
+            if (LogRichTextBox.Document.Blocks.Count > 0)
+                LogRichTextBox.Document.Blocks.Remove(LogRichTextBox.Document.Blocks.FirstBlock);
+        }
 
         if (!_logScrollPending)
         {
@@ -494,7 +511,7 @@ public partial class MainWindow : Window
             Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, new Action(() =>
             {
                 _logScrollPending = false;
-                if (_logLines.Count > 0) LogListBox.ScrollIntoView(_logLines[^1]);
+                LogRichTextBox.ScrollToEnd();
             }));
         }
     }
@@ -512,6 +529,8 @@ public partial class MainWindow : Window
     /// </summary>
     private async void CopyLogButton_Click(object sender, RoutedEventArgs e)
     {
+        await Dispatcher.Yield(DispatcherPriority.Background);
+
         var text = string.Join(Environment.NewLine, _logLines.Select(l => l.Text));
 
         CopyLogButton.IsEnabled = false;
@@ -1420,6 +1439,8 @@ public partial class MainWindow : Window
     }
 
     /// <summary>Runs the real DepotDownloader process for the game-version task. Returns false on pause/cancel or failure.</summary>
+    /// <summary>Runs the real DepotDownloader process for the game-version task. Returns false on pause/cancel or failure.</summary>
+    /// <summary>Runs the real DepotDownloader process for the game-version task. Returns false on pause/cancel or failure.</summary>
     private async Task<bool> RunRealDepotTaskAsync(UpdateTaskItem task, CancellationToken token)
     {
         if (_settings?.ModdedPath is null || string.IsNullOrWhiteSpace(_settings.DepotDownloaderPath))
@@ -1442,8 +1463,101 @@ public partial class MainWindow : Window
             SteamUsername = _settings.SteamUsername
         };
 
+        if (task.ExpectedTotalBytes <= 0)
+        {
+            var cachedSize = _depotSizeCacheService.Get(request.ManifestId);
+            if (cachedSize is > 0)
+                task.ExpectedTotalBytes = cachedSize.Value;
+        }
+
         DateTime lastActivityUtc = DateTime.UtcNow;
         bool stallWarningLogged = false;
+
+        // --- Tracking real de progreso por-archivo ---
+        // Confirmado contra una corrida real de DepotDownloader en consola
+        // directa: el tamaño lógico de un archivo en disco NO sirve para
+        // saber cuánto se descargó de verdad - DepotDownloader pre-asigna
+        // cada archivo a su tamaño final completo ANTES de bajar contenido
+        // real (esto fue lo que causó "35 GB de 289 KB": el disco ya
+        // reflejaba 35 GB reservados con casi nada de contenido real
+        // adentro). Las únicas señales confiables de progreso real son las
+        // propias líneas que imprime DepotDownloader:
+        //   - "Pre-allocating <archivo>" -> se conoce el tamaño final del
+        //     archivo, pero 0 bytes reales todavía.
+        //   - "Validating <archivo>" -> el archivo ya está completo/verificado
+        //     de una corrida anterior - se cuenta como 100% de su tamaño.
+        //   - " NN.NN% <archivo>" -> progreso real de descarga para ese
+        //     archivo puntual.
+        // knownFileSizes es el tamaño final conocido de cada archivo (leído
+        // del propio disco la primera vez que se menciona, ya que para
+        // cuando aparece cualquiera de estas líneas el archivo ya existe
+        // pre-asignado a su tamaño completo). currentFileBytes es cuánto de
+        // ESE archivo se considera realmente descargado ahora mismo. La suma
+        // de currentFileBytes.Values es el total real de bytes bajados.
+        var knownFileSizes = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        var currentFileBytes = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        long knownTotalBytes = 0;
+
+        int validatingLineCount = 0;
+        int preallocatingLineCount = 0;
+        const int SummaryLogInterval = 100;
+
+        long EnsureFileSizeKnown(string filePath)
+        {
+            // Solo confiamos en un tamaño ya cacheado si fue > 0 - un 0
+            // guardado anteriormente puede ser una carrera real (la línea
+            // "Pre-allocating X" llegó antes de que el archivo estuviera
+            // realmente creado/reservado en disco a su tamaño final), no un
+            // archivo genuinamente vacío. Reintentar en cada llamada hasta
+            // conseguir un tamaño real es lo que evita que ese archivo quede
+            // contando cero bytes para siempre, aunque después sí se baje
+            // por completo.
+            if (knownFileSizes.TryGetValue(filePath, out var existing) && existing > 0)
+                return existing;
+
+            long size = 0;
+            try
+            {
+                if (File.Exists(filePath)) size = new FileInfo(filePath).Length;
+            }
+            catch
+            {
+                // Transitorio - se reintenta en la próxima línea que
+                // mencione este mismo archivo.
+            }
+
+            if (size > 0)
+            {
+                knownFileSizes[filePath] = size;
+                knownTotalBytes += size;
+
+                // Solo actualiza el total del task si todavía no había uno
+                // confirmado (cacheado de una corrida anterior completa) -
+                // no pisa un valor ya conocido con uno parcial mientras se
+                // van descubriendo archivos de a poco en esta corrida.
+                if (task.ExpectedTotalBytes <= 0)
+                    task.ExpectedTotalBytes = knownTotalBytes;
+            }
+
+            return size;
+        }
+
+        void RecomputeDownloadedBytes()
+        {
+            task.BytesDownloaded = (long)currentFileBytes.Values.Sum();
+
+            if (task.ExpectedTotalBytes > 0 && task.BytesDownloaded > task.ExpectedTotalBytes)
+            {
+                AppendLog($"The cached total size for this game version ({FormatBytes(task.ExpectedTotalBytes)}) turned out to be smaller than what's " +
+                          $"already been downloaded ({FormatBytes(task.BytesDownloaded)}) - it was clearly wrong. Discarding it and recalculating " +
+                          "from the files seen so far in this run.", LogLevel.Warning);
+                task.ExpectedTotalBytes = knownTotalBytes;
+                _depotSizeCacheService.Remove(request.ManifestId);
+            }
+
+            if (task.ExpectedTotalBytes > 0)
+                task.RealTimeProgressPercent = Math.Clamp(100.0 * task.BytesDownloaded / task.ExpectedTotalBytes, 0, 100);
+        }
 
         var progress = new Progress<DepotDownloadProgress>(p =>
         {
@@ -1452,8 +1566,6 @@ public partial class MainWindow : Window
 
             if (p.PercentComplete >= 0)
             {
-                task.RealTimeProgressPercent = p.PercentComplete;
-
                 // Login succeeded and the actual download is under way — the QR
                 // window / credential window (if any) has served its purpose.
                 if (_qrLoginWindow is not null)
@@ -1467,36 +1579,69 @@ public partial class MainWindow : Window
                     _credentialPromptWindow.Close();
                     _credentialPromptWindow = null;
                 }
-
-                RefreshUpdateProgressUi();
             }
-            else if (!string.IsNullOrWhiteSpace(p.StatusLine))
-            {
-                // Log every other line DepotDownloader prints too - otherwise
-                // an unrecognized prompt (different wording than we expect)
-                // just sits there silently instead of giving anyone a clue.
-                AppendLog($"[DepotDownloader] {p.StatusLine}");
 
-                // If the credential window is still open, it means a password
-                // (or Steam Guard code) was already submitted and is showing
-                // a static "Verifying..." - without this, that message never
-                // changes until either a repeated prompt or the process's
-                // eventual exit, even if DepotDownloader is actively
-                // reporting what's really happening (retrying, connecting,
-                // or an outright login failure worded differently than the
-                // repeatable-prompt patterns this app recognizes). Mirror
-                // whatever DepotDownloader just printed into the window
-                // itself so the person isn't staring at a frozen message.
+            if (!string.IsNullOrWhiteSpace(p.StatusLine))
+            {
+                var trimmedLine = p.StatusLine.TrimStart();
+                var perFileMatch = PerFilePercentLinePattern.Match(p.StatusLine);
+
+                if (trimmedLine.StartsWith("Validating ", StringComparison.OrdinalIgnoreCase))
+                {
+                    var filePath = trimmedLine["Validating ".Length..].Trim();
+                    var size = EnsureFileSizeKnown(filePath);
+                    currentFileBytes[filePath] = size; // ya completo/verificado - cuenta como 100%
+                    RecomputeDownloadedBytes();
+
+                    validatingLineCount++;
+                    if (validatingLineCount % SummaryLogInterval == 0)
+                        AppendLog($"[DepotDownloader] Validated {validatingLineCount} files so far (already up to date)...");
+                }
+                else if (trimmedLine.StartsWith("Pre-allocating ", StringComparison.OrdinalIgnoreCase))
+                {
+                    var filePath = trimmedLine["Pre-allocating ".Length..].Trim();
+                    EnsureFileSizeKnown(filePath); // tamaño conocido, 0 bytes reales todavía
+
+                    preallocatingLineCount++;
+                    if (preallocatingLineCount % SummaryLogInterval == 0)
+                        AppendLog($"[DepotDownloader] Pre-allocated {preallocatingLineCount} files so far ({FormatBytes(knownTotalBytes)} total known)...");
+                }
+                else if (perFileMatch.Success)
+                {
+                    var filePath = perFileMatch.Groups[2].Value.Trim();
+                    if (double.TryParse(perFileMatch.Groups[1].Value, out var filePercent))
+                    {
+                        var size = EnsureFileSizeKnown(filePath);
+                        currentFileBytes[filePath] = size * Math.Clamp(filePercent / 100.0, 0, 1);
+                        RecomputeDownloadedBytes();
+                    }
+                    // No se loguea cada línea de porcentaje por-archivo - son
+                    // demasiado frecuentes y no aportan nada que RecomputeDownloadedBytes
+                    // no esté ya reflejando en la UI en tiempo real.
+                }
+                else
+                {
+                    // Diagnóstico: si DepotDownloaderService ya detectó un
+                    // porcentaje en esta línea (PercentComplete >= 0) pero
+                    // nuestro regex más específico (PerFilePercentLinePattern)
+                    // no la reconoció como línea de progreso por-archivo, el
+                    // formato real difiere del asumido - lo marcamos explícito
+                    // en vez de dejar que se pierda silenciosamente en el log
+                    // normal como si fuera una línea cualquiera de login/manifest.
+                    if (p.PercentComplete >= 0)
+                        AppendLog($"[DepotDownloader] [UNMATCHED PERCENT LINE] '{p.StatusLine}'", LogLevel.Warning);
+                    else
+                        AppendLog($"[DepotDownloader] {p.StatusLine}");
+                }
+
                 _credentialPromptWindow?.SetStatus(p.StatusLine);
             }
+
+            RefreshUpdateProgressUi();
         });
 
         void OnQrAsciiBlock(string[] lines)
         {
-            // Once the user has cancelled, ignore any further QR blocks that
-            // were already in flight - otherwise a block DepotDownloader had
-            // already queued before the kill took effect could pop the window
-            // back open right after Cancel closed it.
             if (_loginCancelledByUser) return;
 
             if (_qrLoginWindow is null)
@@ -1512,7 +1657,6 @@ public partial class MainWindow : Window
             }
             else
             {
-                // DepotDownloader issued a fresh challenge (the previous one expired unscanned).
                 _qrLoginWindow.SetQrAsciiBlock(lines);
             }
         }
@@ -1541,33 +1685,57 @@ public partial class MainWindow : Window
             }
         });
 
-        // DepotDownloader's own printed percentage (fed into task.RealTimeProgressPercent
-        // above) applies per-file, not to the whole depot - a large file
-        // starting fresh right after a small one finishes restarts its own
-        // 0-100% cycle, which can look "stuck" or even step backward for a
-        // while even though real progress is happening. This instead tracks
-        // actual bytes written to disk under the Modded folder, which is
-        // immune to that and only ever grows. Baseline is captured now
-        // (before the process starts) so BytesDownloaded reflects what's
-        // been added THIS run - note that also means it starts back at 0
-        // after every Pause/Resume cycle (each is a fresh process/fresh
-        // RunRealDepotTaskAsync call), rather than accumulating across them;
-        // it's still always accurate for "how much has this session pulled
-        // down so far", just not a running total spanning multiple pauses.
-        var byteTrackingBaseline = await Task.Run(() => ComputeDirectoryByteSize(_settings.ModdedPath), CancellationToken.None);
+        // Segundo watchdog: ya no recalcula bytes escaneando el disco (eso
+        // es justo lo que causaba el número inflado por pre-allocation) -
+        // solo vigila si task.BytesDownloaded (ahora alimentado por las
+        // líneas de progreso reales de arriba) dejó de crecer por un buen
+        // rato, sea porque DepotDownloader sigue "hablando" por stdout con
+        // líneas repetitivas o directamente se quedó mudo.
+        DateTime lastByteGrowthUtc = DateTime.UtcNow;
+        long lastSeenBytesDownloaded = 0;
+        bool byteStallWarningLogged = false;
+        DateTime lastProgressLogUtc = DateTime.MinValue;
 
-        using var byteTrackingCts = CancellationTokenSource.CreateLinkedTokenSource(token);
-        var byteTrackingTask = Task.Run(async () =>
+        using var byteWatchdogCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var byteWatchdogTask = Task.Run(async () =>
         {
             try
             {
                 while (true)
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(5), byteTrackingCts.Token);
+                    await Task.Delay(TimeSpan.FromSeconds(5), byteWatchdogCts.Token);
 
-                    var currentTotal = ComputeDirectoryByteSize(_settings.ModdedPath);
-                    task.BytesDownloaded = Math.Max(0, currentTotal - byteTrackingBaseline);
-                    RefreshUpdateProgressUi();
+                    var currentBytes = task.BytesDownloaded;
+
+                    task.CurrentSpeedBytesPerSecond = Math.Max(0, (currentBytes - lastSeenBytesDownloaded) / 5.0);
+
+                    if (currentBytes > lastSeenBytesDownloaded)
+                    {
+                        lastByteGrowthUtc = DateTime.UtcNow;
+                        byteStallWarningLogged = false;
+
+                        // Resumen periódico en el log (NO cada línea de %,
+                        // eso ya se decidió suprimir por ruido) para que la
+                        // consola misma confirme que hay avance real, sin
+                        // depender de mirar la UI en vivo o de que el usuario
+                        // asuma "silencio = trabado".
+                        var elapsedSinceLastLog = DateTime.UtcNow - lastProgressLogUtc;
+                        if (elapsedSinceLastLog > TimeSpan.FromSeconds(30))
+                        {
+                            lastProgressLogUtc = DateTime.UtcNow;
+                            var totalSuffix = task.ExpectedTotalBytes > 0 ? $" of {FormatBytes(task.ExpectedTotalBytes)}" : "";
+                            AppendLog($"[progress] {FormatBytes(currentBytes)}{totalSuffix} downloaded so far ({FormatSpeed(task.CurrentSpeedBytesPerSecond)}).");
+                        }
+                    }
+                    lastSeenBytesDownloaded = currentBytes;
+
+                    if (!byteStallWarningLogged && DateTime.UtcNow - lastByteGrowthUtc > TimeSpan.FromSeconds(45))
+                    {
+                        byteStallWarningLogged = true;
+                        AppendLog("No download progress for any file in the last 45 seconds. " +
+                                  "DepotDownloader may be validating large already-present files (can legitimately " +
+                                  "take a while), or it may genuinely be stuck. Check the lines above, or try Pause/Resume.", LogLevel.Warning);
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -1588,14 +1756,17 @@ public partial class MainWindow : Window
         stallWatchdogCts.Cancel();
         try { await watchdogTask; } catch (OperationCanceledException) { }
 
-        byteTrackingCts.Cancel();
-        try { await byteTrackingTask; } catch (OperationCanceledException) { }
+        byteWatchdogCts.Cancel();
+        try { await byteWatchdogTask; } catch (OperationCanceledException) { }
 
         _qrLoginWindow?.Close();
         _qrLoginWindow = null;
 
         _credentialPromptWindow?.Close();
         _credentialPromptWindow = null;
+
+        if (result.Outcome == DepotDownloadOutcome.Success && knownTotalBytes > 0)
+            _depotSizeCacheService.Set(request.ManifestId, knownTotalBytes);
 
         switch (result.Outcome)
         {
@@ -1614,9 +1785,7 @@ public partial class MainWindow : Window
             default:
                 return false;
         }
-    }
-
-    /// <summary>
+    }    /// <summary>
     /// Fully stops the current update (as opposed to Pause, which preserves
     /// progress and shows Resume). Used when the user cancels the QR/password
     /// sign-in prompt: the UI reverts to Update/Run, requiring a fresh click
@@ -2104,7 +2273,12 @@ public partial class MainWindow : Window
 
     private async Task<bool> RunInstallTaskAsync(string componentKey, CancellationToken token)
     {
-        if (_settings?.ModdedPath is null) return false;
+        if (string.IsNullOrWhiteSpace(_settings?.ModdedPath))
+        {
+            AppendLog($"Cannot install {componentKey}: the Modded folder isn't configured (it's empty). " +
+                      "Check Settings and make sure a Modded folder is set.", LogLevel.Error);
+            return false;
+        }
 
         if (!_componentStagingDirs.TryGetValue(componentKey, out var stagingDir))
         {
@@ -2481,19 +2655,22 @@ public partial class MainWindow : Window
             GameDownloadProgressBar.Value = gamePercent;
             GameDownloadPercentText.Text = $"{gamePercent:0.0}%";
 
-            // DepotDownloader's own printed percentage applies per-file, not
-            // to the whole depot - a huge file starting fresh after a small
-            // one finishes can make the number above plateau or even step
-            // backward-looking for a while even though real progress is
-            // happening. currentTask.BytesDownloaded is instead kept updated
-            // by a filesystem poll (see StartGameDownloadByteTracking) that
-            // sums actual bytes written under the Modded folder since this
-            // task started - immune to that per-file reset, and always
-            // strictly increasing. No total is shown since DepotDownloader
-            // doesn't expose the depot's overall size to us.
-            GameDownloadBytesText.Text = currentTask.BytesDownloaded > 0
-                ? $"{FormatBytes(currentTask.BytesDownloaded)} downloaded so far"
+            // Si conocemos el tamaño total del depot (ver el chequeo de
+            // _depotSizeCacheService en RunRealDepotTaskAsync), mostramos
+            // "X of Y downloaded" en vez de solo "X hasta ahora". El % de
+            // arriba (GameDownloadPercentText) ya sale de bytes reales
+            // cuando el total es conocido - ver byteTrackingTask en
+            // RunRealDepotTaskAsync - así que ambos números quedan
+            // consistentes entre sí.
+            var speedSuffix = currentTask.CurrentSpeedBytesPerSecond > 0
+                ? $" — {FormatSpeed(currentTask.CurrentSpeedBytesPerSecond)}"
                 : string.Empty;
+
+            GameDownloadBytesText.Text = currentTask.ExpectedTotalBytes > 0
+                ? $"{FormatBytes(currentTask.BytesDownloaded)} of {FormatBytes(currentTask.ExpectedTotalBytes)} downloaded{speedSuffix}"
+                : currentTask.BytesDownloaded > 0
+                    ? $"{FormatBytes(currentTask.BytesDownloaded)} downloaded so far (total size unknown){speedSuffix}"
+                    : string.Empty;
         }
         else
         {
@@ -2515,6 +2692,19 @@ public partial class MainWindow : Window
         };
     }
 
+    /// <summary>Formats a bytes/second rate as "512 KB/s"/"12.4 MB/s"-style text, same granularity convention as FormatBytes.</summary>
+    private static string FormatSpeed(double bytesPerSecond)
+    {
+        const double kb = 1024, mb = kb * 1024, gb = mb * 1024;
+
+        return bytesPerSecond switch
+        {
+            >= gb => $"{bytesPerSecond / gb:0.00} GB/s",
+            >= mb => $"{bytesPerSecond / mb:0.0} MB/s",
+            >= kb => $"{bytesPerSecond / kb:0} KB/s",
+            _ => $"{bytesPerSecond:0} B/s"
+        };
+    }
     /// <summary>
     /// Sums the size of every file under a directory tree. Used to poll real,
     /// filesystem-level download progress during a DepotDownloader run,

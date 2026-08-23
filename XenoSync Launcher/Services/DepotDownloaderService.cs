@@ -59,7 +59,10 @@ public class DepotDownloadResult
 /// one - without a cached login, that fresh process has nothing to reuse and
 /// re-prompts from scratch every time, which for QR meant re-scanning a code
 /// on every single Pause/Resume cycle even though the user had already
-/// signed in once in the same session.
+/// signed in once in the same session. The same caching is what lets
+/// EstimateSizeAsync run right before a real RunAsync call without prompting
+/// the user twice: the estimate pass signs in and caches a session, and the
+/// download pass right after reuses it silently.
 ///
 /// Output parsing also treats a bare '\r' (carriage return with no '\n') as
 /// its own line boundary, not just '\n'. DepotDownloader prints per-file
@@ -79,6 +82,8 @@ public class DepotDownloaderService
 
     /// <summary>The character DepotDownloader's QR block-art decodes to on this system (see class remarks). Marks a "dark" module.</summary>
     private const char QrDarkModuleChar = 'Û';
+
+    private const long MinimumPlausibleDepotSizeBytes = 1_000_000; // 1 MB
 
     public async Task<DepotDownloadResult> RunAsync(
         string depotDownloaderExecutablePath,
@@ -158,7 +163,209 @@ public class DepotDownloaderService
         return new DepotDownloadResult { Outcome = DepotDownloadOutcome.Success };
     }
 
-    private static string BuildArguments(DepotDownloadRequest request)
+    /// <summary>
+    /// Runs DepotDownloader in "-manifest-only" mode against a dedicated
+    /// scratch directory (never the real InstallDirectory - this must never
+    /// touch real game files) to learn the depot's total byte size WITHOUT
+    /// downloading its content. This is what lets XenoSync Launcher show
+    /// "X of Y downloaded" for the real game-version download without
+    /// anyone having to hand-curate a size value anywhere: DepotDownloader
+    /// can tell us this directly, the same way it already tells us
+    /// everything else about a manifest.
+    ///
+    /// Requires signing in to Steam, same as a real download - reuses the
+    /// same "-remember-password" caching described in RunAsync's class
+    /// remarks, so when this runs right before the actual download (the
+    /// normal call order - see MainWindow.RunRealDepotTaskAsync), the
+    /// download step signs in silently using the session this step just
+    /// cached, instead of prompting the user for QR/credentials twice in a row.
+    ///
+    /// Callers should cache the returned size against ManifestId (see
+    /// DepotSizeCacheService) - a manifest's size never changes, so there's
+    /// no reason to repeat this pass on every Update/Resume for the same
+    /// downgrade target.
+    ///
+    /// NOTE: parses DepotDownloader's "-manifest-only" dump using its
+    /// documented column order (File, Size, Chunks, Hash, tab-separated,
+    /// with Size as the second column) - this has not been verified against
+    /// a real run at the time of writing, unlike the QR block-art handling
+    /// elsewhere in this class, which was. If a DepotDownloader release ever
+    /// changes that dump's format, ParseManifestSizeFile logs a diagnostic
+    /// instead of silently returning 0, so a mismatch is visible in the log
+    /// rather than just showing "size unknown" with no explanation.
+    /// </summary>
+    public async Task<(bool Success, long? SizeBytes, string? ErrorMessage)> EstimateSizeAsync(
+        string depotDownloaderExecutablePath,
+        DepotDownloadRequest request,
+        Action<string[]> onQrAsciiBlock,
+        Func<Task<string?>> passwordPrompt,
+        Func<Task<string?>> steamGuardCodePrompt,
+        Action<string>? onDiagnostic,
+        CancellationToken cancellationToken)
+    {
+        if (!File.Exists(depotDownloaderExecutablePath))
+            return (false, null, $"DepotDownloader executable not found at '{depotDownloaderExecutablePath}'.");
+
+        var probeRequest = new DepotDownloadRequest
+        {
+            AppId = request.AppId,
+            DepotId = request.DepotId,
+            ManifestId = request.ManifestId,
+            InstallDirectory = request.InstallDirectory,
+            LoginMethod = request.LoginMethod,
+            SteamUsername = request.SteamUsername
+        };
+
+        var arguments = BuildArguments(probeRequest, manifestOnly: true);
+        onDiagnostic?.Invoke($"Estimating depot size: \"{depotDownloaderExecutablePath}\" {arguments}");
+
+        var psi = new ProcessStartInfo(depotDownloaderExecutablePath, arguments)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            StandardOutputEncoding = System.Text.Encoding.Latin1
+        };
+
+        using var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
+
+        try
+        {
+            process.Start();
+        }
+        catch (Exception ex)
+        {
+            return (false, null, ex.Message);
+        }
+
+        await using var registration = cancellationToken.Register(() =>
+        {
+            try { if (!process.HasExited) process.Kill(entireProcessTree: true); }
+            catch { /* already exited */ }
+        });
+
+        // Reuses the exact same stdout handling as a real run (QR block-art /
+        // credential prompts) - "-manifest-only" still has to sign in to
+        // Steam like any other request, it just skips downloading the actual
+        // file bytes afterward, so the percent/progress side of this is unused.
+        var noOpProgress = new Progress<DepotDownloadProgress>();
+        var readOutputTask = ReadStreamAsync(process, request.LoginMethod, noOpProgress, onQrAsciiBlock, passwordPrompt, steamGuardCodePrompt, cancellationToken);
+        var readErrorTask = process.StandardError.ReadToEndAsync();
+
+        await process.WaitForExitAsync(CancellationToken.None);
+        await Task.WhenAll(readOutputTask, readErrorTask);
+
+        if (cancellationToken.IsCancellationRequested)
+            return (false, null, "Cancelled");
+
+        if (process.ExitCode != 0)
+            return (false, null, $"DepotDownloader exited with code {process.ExitCode} while estimating size. {await readErrorTask}");
+
+        var depotDownloaderStagingDir = Path.Combine(request.InstallDirectory, ".DepotDownloader");
+        var manifestFile = Directory.Exists(depotDownloaderStagingDir)
+            ? Directory.GetFiles(depotDownloaderStagingDir, "*.manifest", SearchOption.AllDirectories)
+                .OrderByDescending(File.GetLastWriteTimeUtc)
+                .FirstOrDefault()
+            : null;
+
+        if (manifestFile is null)
+        {
+            onDiagnostic?.Invoke($"'-manifest-only' finished but no '*.manifest' dump file was found under '{depotDownloaderStagingDir}'.");
+            return (false, null, "No manifest dump file was produced.");
+        }
+
+        var size = ParseManifestSizeFile(manifestFile, onDiagnostic);
+
+        return size is > 0
+            ? (true, size, null)
+            : (false, null, "Could not determine a plausible total size from the manifest dump.");
+    }
+
+    private static void TryDeleteScratch(string scratchDir)
+    {
+        try { Directory.Delete(scratchDir, recursive: true); }
+        catch { /* best-effort cleanup - a leftover scratch folder is harmless */ }
+    }
+
+    /// <summary>
+    /// Parses DepotDownloader's "-manifest-only" text dump: a header line
+    /// followed by one tab-separated row per file, with Size as the second
+    /// column (File, Size, Chunks, Hash, ...) per DepotDownloader's own
+    /// documented format. Sums every row's Size column. Tolerant of extra
+    /// whitespace and of individual rows failing to parse (skipped, not
+    /// fatal) - only reports failure if NOTHING at all could be read, which
+    /// is the actual signal that the format assumption above is wrong.
+    /// </summary>
+    /// <summary>
+    /// Parses DepotDownloader's "-manifest-only" text dump: a header line
+    /// followed by one tab-separated row per file, with Size as the second
+    /// column (File, Size, Chunks, Hash, ...) per DepotDownloader's own
+    /// documented format. Sums every row's Size column.
+    ///
+    /// Applies MinimumPlausibleDepotSizeBytes as a sanity floor on the final
+    /// total: a real Steam game depot is never a handful of bytes, so a
+    /// result under that floor means the column-format assumption above is
+    /// wrong for this DepotDownloader build (e.g. a different separator, a
+    /// different column order, or a completely different dump layout) - not
+    /// that the depot is genuinely tiny. Treated as a failure (null) rather
+    /// than trusted, with a diagnostic dump of the file's actual content so
+    /// the real format can be identified and fixed.
+    /// </summary>
+    private static long? ParseManifestSizeFile(string path, Action<string>? onDiagnostic)
+    {
+        try
+        {
+            var lines = File.ReadAllLines(path);
+            long total = 0;
+            int parsedRows = 0;
+
+            // Skip the header row (line 0) - everything else is one file per line.
+            for (int i = 1; i < lines.Length; i++)
+            {
+                var columns = lines[i].Split('\t', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+                if (columns.Length < 2) continue;
+
+                if (long.TryParse(columns[1], out var size))
+                {
+                    total += size;
+                    parsedRows++;
+                }
+            }
+
+            if (parsedRows == 0)
+            {
+                onDiagnostic?.Invoke($"'{path}' didn't parse as expected (0 rows read) - DepotDownloader's manifest-dump format " +
+                                     "may differ from what's assumed here (File, Size, Chunks, Hash tab-separated columns). " +
+                                     $"First lines:\n{DumpFirstLines(lines)}");
+                return null;
+            }
+
+            if (total < MinimumPlausibleDepotSizeBytes)
+            {
+                onDiagnostic?.Invoke($"'{path}' parsed to an implausible total ({total} bytes across {parsedRows} row(s)) - " +
+                                     "no real game depot is that small, so this is being treated as a parsing mismatch, not a real size. " +
+                                     $"First lines:\n{DumpFirstLines(lines)}");
+                return null;
+            }
+
+            return total;
+        }
+        catch (Exception ex)
+        {
+            onDiagnostic?.Invoke($"Failed to read/parse '{path}': {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>First few lines of a text dump, for diagnostic logging when the parse looks wrong - enough to see the real column layout without flooding the log with an entire multi-thousand-line file list.</summary>
+    private static string DumpFirstLines(string[] lines, int maxLines = 5)
+    {
+        if (lines.Length == 0) return "(empty file)";
+        return string.Join('\n', lines.Take(maxLines).Select(l => $"  {l}"));
+    }
+    private static string BuildArguments(DepotDownloadRequest request, bool manifestOnly = false)
     {
         var args = $"-app {request.AppId} -manifest {request.ManifestId} -dir \"{request.InstallDirectory}\"";
 
@@ -173,9 +380,14 @@ public class DepotDownloaderService
         // this flag on the QR branch, that fresh process has no cached
         // session at all and re-prompts for a full QR scan on every single
         // Pause/Resume cycle, even though the user already signed in once.
+        // It's also what lets EstimateSizeAsync run immediately before a
+        // real RunAsync call without prompting the user twice in a row.
         args += request.LoginMethod == SteamLoginMethod.QrCode
             ? " -qr -remember-password"
             : $" -username {request.SteamUsername} -remember-password";
+
+        if (manifestOnly)
+            args += " -manifest-only";
 
         return args;
     }
