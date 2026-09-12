@@ -719,7 +719,7 @@ public partial class MainWindow : Window
                 : $"Failed to install {record.Title}: {error}", success ? LogLevel.Info : LogLevel.Error);
         }
 
-        _modCatalogService.Save(_modRecordsById.Values.ToList());
+        _modCatalogService.Save(_settings.ModdedPath, _modRecordsById.Values.ToList());
     }
 
     private async void ModEntry_PropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
@@ -804,7 +804,7 @@ public partial class MainWindow : Window
                 }
             }
 
-            _modCatalogService.Save(_modRecordsById.Values.ToList());
+            _modCatalogService.Save(_settings.ModdedPath, _modRecordsById.Values.ToList());
             RefreshRunButtonState();
         }
         catch (Exception ex)
