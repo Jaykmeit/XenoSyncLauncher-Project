@@ -22,7 +22,21 @@ namespace XenoSyncLauncher.Services;
 ///
 /// Local-only state (IsEnabled for Optional mods, RepositoryFolder,
 /// InstalledRelativeFiles) is preserved across catalog refreshes by keying
-/// off ModRecord.Id and persisted in mods.json.
+/// off ModRecord.Id and persisted in "&lt;ModdedPath&gt;/XenoSync/mods.json" -
+/// i.e. INSIDE the Modded folder itself, not in a single global
+/// %APPDATA%-wide file. This matters as soon as more than one Modded folder
+/// is ever used on the same Windows profile (e.g. switching the configured
+/// Modded path from folder A to folder B and back to A): a single shared
+/// mods.json can't tell which folder a given IsEnabled/RepositoryFolder/
+/// InstalledRelativeFiles state belongs to, so state written while B was
+/// configured (including a mod being auto-flagged NeedsUpdate because its
+/// files don't exist under B, and later Disabled because of that) would
+/// silently bleed into A's view of things and vice versa - this is what
+/// caused mods that were genuinely still installed in A to show up
+/// unchecked after a round trip through B. Scoping the file to the Modded
+/// folder itself (the same approach InstalledComponentVersionService
+/// already uses for the XV2Patcher/Revamp version bookkeeping) means each
+/// Modded folder keeps its own, independent record.
 /// </summary>
 public class ModCatalogService
 {
@@ -35,10 +49,10 @@ public class ModCatalogService
         _remoteConfigService = remoteConfigService ?? new RemoteConfigService();
     }
 
-    private static string LocalStatePath => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XenoSyncLauncher", "mods.json");
-
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+
+    /// <summary>Where a given Modded folder's own mods.json lives - alongside installed-versions.json, inside "&lt;ModdedPath&gt;/XenoSync/".</summary>
+    private static string LocalStatePathFor(string moddedPath) => Path.Combine(moddedPath, "XenoSync", "mods.json");
 
     /// <summary>
     /// Same layout ModInstallService.RepositoryFolderFor uses: where a mod's
@@ -50,9 +64,16 @@ public class ModCatalogService
     private static string RepositoryFolderFor(string moddedPath, string modId) =>
         Path.Combine(moddedPath, "XenoSync", "DownloadedMods", modId);
 
+    /// <summary>
+    /// When moddedPath is null (no Modded folder configured yet - e.g. right
+    /// after a fresh install before the Wizard finishes), there's nowhere to
+    /// read/write per-folder local state from, so the catalog is built with
+    /// no local overrides at all: every mod shows as not-installed until a
+    /// Modded folder is actually configured and this is called again with it.
+    /// </summary>
     public async Task<List<ModRecord>> LoadAsync(string? moddedPath = null)
     {
-        var localById = LoadLocalState().ToDictionary(m => m.Id);
+        var localById = (moddedPath is not null ? LoadLocalState(moddedPath) : new List<ModRecord>()).ToDictionary(m => m.Id);
         var remoteMods = await _remoteConfigService.GetModsAsync();
 
         var result = new List<ModRecord>
@@ -79,28 +100,24 @@ public class ModCatalogService
                 ? remote.DownloadUrls
                 : (remote.DownloadUrl is not null ? new List<string> { remote.DownloadUrl } : new List<string>());
 
-            // Don't just trust what mods.json says was installed - a Modded
-            // reinstall, manual cleanup, or a botched previous update could
-            // have wiped the actual files without the record ever being
-            // updated to reflect that. Verify every recorded file is still
-            // there; if it claims enabled but isn't verifiably so, that's a
-            // signal it needs a fresh Update/Reinstall (NeedsUpdate), not
-            // silent trust that it's actually working.
+            // Don't just trust what this Modded folder's mods.json says was
+            // installed - a Modded reinstall, manual cleanup, or a botched
+            // previous update could have wiped the actual files without the
+            // record ever being updated to reflect that. Verify every
+            // recorded file is still there; if it claims enabled but isn't
+            // verifiably so, that's a signal it needs a fresh Update/Reinstall
+            // (NeedsUpdate), not silent trust that it's actually working.
             bool recordedEnabled = category == ModCategory.XenoSyncCore
                 ? existing is { RepositoryFolder: not null } && existing.InstalledRelativeFiles.Count > 0
                 : existing?.IsEnabled ?? false;
 
-            // mods.json lives under %APPDATA% - tied to this Windows profile,
-            // not to the Modded folder itself. A mod's extracted repository
-            // copy, on the other hand, lives INSIDE the Modded folder at
-            // "<ModdedPath>/XenoSync/DownloadedMods/<id>" - so it travels
-            // with the Modded folder even when mods.json doesn't (a new
-            // Windows profile/machine, AppData getting cleared, or the
-            // Modded folder being copied/moved elsewhere all desync
-            // mods.json from reality without touching this). Without this
-            // check, such a mod would permanently show as "not installed"
-            // despite its files plainly being present on disk - this is the
-            // "no me marca que estén instalados algunos mods" report.
+            // mods.json now lives INSIDE this Modded folder (see class docs),
+            // so it travels with it the same way RepositoryFolder does. Still
+            // worth tolerating a repository folder that exists on disk but
+            // isn't yet reflected in mods.json (e.g. mods.json was deleted
+            // manually, or files were copied in from elsewhere) instead of
+            // permanently showing "not installed" despite the raw extracted
+            // files plainly being present.
             var repositoryFolder = existing?.RepositoryFolder ?? (moddedPath is not null ? RepositoryFolderFor(moddedPath, remote.Id) : null);
             bool repositoryFolderExistsOnDisk = repositoryFolder is not null && Directory.Exists(repositoryFolder);
 
@@ -140,6 +157,7 @@ public class ModCatalogService
                 ScreenshotUrls = remote.ScreenshotUrls ?? new List<string>(),
                 ParentId = remote.Parent,
                 Category = category,
+                MergeTargetSubfolder = remote.MergeTargetSubfolder,
                 IsEnabled = isActuallyInstalled,
                 RepositoryFolder = existing?.RepositoryFolder ?? (repositoryFolderExistsOnDisk ? repositoryFolder : null),
                 InstalledRelativeFiles = existing?.InstalledRelativeFiles ?? new List<string>(),
@@ -149,7 +167,7 @@ public class ModCatalogService
 
         result = ReorderChildrenAfterParents(result);
 
-        Save(result);
+        if (moddedPath is not null) Save(moddedPath, result);
         return result;
     }
 
@@ -197,8 +215,7 @@ public class ModCatalogService
         // cleanup...). Verify the same key file used elsewhere to confirm a
         // real Revamp install (see IsRevampInstalledCorrectly in MainWindow).
         //
-        // Unlike Optional/XenoSyncCore mods, this doesn't suffer from the
-        // mods.json-vs-ModdedPath desync described above: installed-versions.json
+        // Like Optional/XenoSyncCore mods' own mods.json, installed-versions.json
         // already lives INSIDE the Modded folder (at "<ModdedPath>/XenoSync/"),
         // so it travels with it the same way RepositoryFolder does - no
         // separate on-disk existence check is needed here.
@@ -239,19 +256,22 @@ public class ModCatalogService
         };
     }
 
-    public void Save(List<ModRecord> mods)
+    /// <summary>Persists local mod state into the given Modded folder's own "XenoSync/mods.json" - callers must know which Modded folder this state belongs to.</summary>
+    public void Save(string moddedPath, List<ModRecord> mods)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(LocalStatePath)!);
-        System.IO.File.WriteAllText(LocalStatePath, JsonSerializer.Serialize(mods, JsonOptions));
+        var path = LocalStatePathFor(moddedPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        System.IO.File.WriteAllText(path, JsonSerializer.Serialize(mods, JsonOptions));
     }
 
-    private static List<ModRecord> LoadLocalState()
+    private static List<ModRecord> LoadLocalState(string moddedPath)
     {
-        if (!System.IO.File.Exists(LocalStatePath)) return new List<ModRecord>();
+        var path = LocalStatePathFor(moddedPath);
+        if (!System.IO.File.Exists(path)) return new List<ModRecord>();
 
         try
         {
-            return JsonSerializer.Deserialize<List<ModRecord>>(System.IO.File.ReadAllText(LocalStatePath), JsonOptions) ?? new List<ModRecord>();
+            return JsonSerializer.Deserialize<List<ModRecord>>(System.IO.File.ReadAllText(path), JsonOptions) ?? new List<ModRecord>();
         }
         catch
         {
