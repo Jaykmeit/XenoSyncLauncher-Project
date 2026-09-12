@@ -18,6 +18,12 @@ namespace XenoSyncLauncher.Services;
 /// so they live alongside the actual game install and can be reused for a
 /// later Reinstall without re-downloading). What happens next depends on
 /// what's actually inside:
+///   - mod.MergeTargetSubfolder is set -> merged into that existing
+///     subfolder of the Modded folder instead of the root (see
+///     InstallMergeIntoSubfolder) - used for mods whose real install
+///     instructions are "drag this folder's contents into the matching
+///     folder that's already there" (e.g. InviernoCreations' Chi-Chi DYT
+///     pack, merged into "data/chara/CHI").
 ///   - .x2m file(s) present  -> installed via XV2INS (requires XV2Patcher
 ///     already installed - XV2INS relies on files it sets up).
 ///   - .exe file(s), no .x2m -> run as a self-installer.
@@ -134,9 +140,10 @@ public class ModInstallService
     /// Extracts every mod first, then installs them - grouping every mod
     /// whose install method turns out to be X2M into a single shared XV2INS
     /// invocation (all their .x2m files passed as one combined argument
-    /// list) instead of one XV2INS confirmation per mod. Loose-files and
-    /// .exe-installer mods are still installed one at a time since batching
-    /// only helps with XV2INS's own per-launch confirmation dialog.
+    /// list) instead of one XV2INS confirmation per mod. Loose-files,
+    /// merge-into-subfolder, and .exe-installer mods are still installed one
+    /// at a time since batching only helps with XV2INS's own per-launch
+    /// confirmation dialog.
     ///
     /// Trade-off: XV2INS doesn't tell us which resulting file came from
     /// which .x2m, so a single before/after snapshot around the whole batch
@@ -168,6 +175,19 @@ public class ModInstallService
                 if (IsNightContonCity(mod))
                 {
                     results[mod.Id] = await InstallNightContonCityAsync(mod, mod.RepositoryFolder!, moddedPath, onStatus, cancellationToken);
+                    continue;
+                }
+
+                // Catalog-declared "merge this into an existing subfolder"
+                // mods (e.g. Chi-Chi's DYT pack, merged into
+                // data/chara/CHI) bypass the x2m/exe/loose-files detection
+                // entirely - the catalog already says exactly how they need
+                // to be installed, so there's nothing to infer from what's
+                // inside the extracted folder.
+                if (!string.IsNullOrWhiteSpace(mod.MergeTargetSubfolder))
+                {
+                    onStatus?.Invoke($"Merging {mod.Title} into '{mod.MergeTargetSubfolder}'...");
+                    results[mod.Id] = InstallMergeIntoSubfolder(mod, mod.RepositoryFolder!, moddedPath);
                     continue;
                 }
 
@@ -292,8 +312,17 @@ public class ModInstallService
         return results;
     }
 
-    /// <summary>Which install method a mod's extracted files call for, detected by what's actually in them (see class docs).</summary>
-    public enum ModInstallMethod { LooseFiles, Executable, X2M }
+    /// <summary>
+    /// Which install method a mod's extracted files call for. LooseFiles/
+    /// Executable/X2M are detected by what's actually inside the extracted
+    /// folder (see DetectInstallMethod) - MergeIntoSubfolder is never
+    /// returned by that detection; it's decided directly from the catalog's
+    /// ModRecord.MergeTargetSubfolder before DetectInstallMethod is even
+    /// called (see InstallExtractedModAsync/InstallBatchAsync), since there's
+    /// nothing about the extracted content itself that reliably signals
+    /// "merge me into an existing subfolder" the way an .x2m or .exe does.
+    /// </summary>
+    public enum ModInstallMethod { LooseFiles, Executable, X2M, MergeIntoSubfolder }
 
     /// <summary>Looks at what's inside an already-extracted mod folder to decide how it needs to be installed.</summary>
     public static ModInstallMethod DetectInstallMethod(string extractedFolder, out List<string> installerFiles)
@@ -331,6 +360,16 @@ public class ModInstallService
         // Halloween-asset-filtered install.
         if (IsNightContonCity(mod))
             return await InstallNightContonCityAsync(mod, extractedFolder, moddedPath, onStatus, cancellationToken);
+
+        // Catalog-declared "merge this into an existing subfolder" mods
+        // (e.g. Chi-Chi's DYT pack, merged into data/chara/CHI) bypass the
+        // x2m/exe/loose-files detection entirely - see ModInstallMethod's
+        // remarks on why this can't be inferred from the extracted content.
+        if (!string.IsNullOrWhiteSpace(mod.MergeTargetSubfolder))
+        {
+            onStatus?.Invoke($"Merging {mod.Title} into '{mod.MergeTargetSubfolder}'...");
+            return InstallMergeIntoSubfolder(mod, extractedFolder, moddedPath);
+        }
 
         var method = DetectInstallMethod(extractedFolder, out var installerFiles);
 
@@ -539,6 +578,68 @@ public class ModInstallService
         return (true, null);
     }
 
+    /// <summary>
+    /// Installs a mod by merging its extracted content into an existing
+    /// subfolder of the Modded folder (mod.MergeTargetSubfolder), instead of
+    /// dropping the raw extracted files at the Modded root or trying to
+    /// infer an x2m/exe/loose-files method from what's inside. Used for mods
+    /// whose real, manual install instructions amount to "drag this folder's
+    /// contents into the matching folder that's already there" - e.g.
+    /// InviernoCreations' Chi-Chi DYT pack, whose "CHI" folder needs to be
+    /// merged into the already-installed "data/chara/CHI", not extracted as
+    /// a sibling "CHI" folder next to the game's own bin/data.
+    ///
+    /// If the extracted archive wraps everything in a single top-level
+    /// folder (a common "the whole mod lives inside one folder" archive
+    /// layout), that wrapper is flattened first - mirroring the same
+    /// flattening MainWindow's own install pipeline applies to Revamp/XV2INS
+    /// - so the mod's actual payload lands directly under
+    /// MergeTargetSubfolder instead of one level too deep.
+    /// </summary>
+    private static (bool Success, string? ErrorMessage) InstallMergeIntoSubfolder(ModRecord mod, string extractedFolder, string moddedPath)
+    {
+        var targetSubfolder = mod.MergeTargetSubfolder!.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
+        var targetDir = Path.Combine(moddedPath, targetSubfolder);
+        Directory.CreateDirectory(targetDir);
+
+        var source = FlattenSingleWrapperFolder(extractedFolder);
+
+        var written = new List<string>();
+        foreach (var file in Directory.GetFiles(source, "*", SearchOption.AllDirectories))
+        {
+            var relativeToSource = Path.GetRelativePath(source, file);
+            var destination = Path.Combine(targetDir, relativeToSource);
+            var relativeToModded = Path.GetRelativePath(moddedPath, destination);
+
+            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+            System.IO.File.Copy(file, destination, overwrite: true);
+            written.Add(relativeToModded);
+        }
+
+        if (written.Count == 0)
+            return (false, $"{mod.Title}'s extracted files were empty - nothing was merged into '{targetSubfolder}'.");
+
+        mod.InstalledRelativeFiles = written;
+        mod.IsEnabled = true;
+        return (true, null);
+    }
+
+    /// <summary>
+    /// If <paramref name="dir"/> contains exactly one entry and it's a
+    /// subfolder (the typical "everything wrapped in one top folder" archive
+    /// layout), returns that subfolder's path instead, so callers merge its
+    /// *contents* rather than re-creating that wrapper folder inside the
+    /// destination. Otherwise returns <paramref name="dir"/> unchanged.
+    /// </summary>
+    private static string FlattenSingleWrapperFolder(string dir)
+    {
+        var entries = Directory.GetFileSystemEntries(dir);
+        if (entries.Length == 1 && Directory.Exists(entries[0]))
+            return entries[0];
+
+        return dir;
+    }
+
     /// <summary>Runs a mod's self-installer .exe(s), then diffs the Modded folder's file list before/after to learn what it actually wrote (installers don't hand back a manifest).</summary>
     private async Task<(bool Success, string? ErrorMessage)> InstallViaExecutableAsync(
         ModRecord mod, List<string> exeFiles, string moddedPath, Action<string>? onStatus, CancellationToken token)
@@ -679,7 +780,7 @@ public class ModInstallService
         return partFiles.OrderBy(f => f, StringComparer.OrdinalIgnoreCase).First();
     }
 
-    /// <summary>Deletes exactly the files this mod is recorded as having written, then clears that record. Works the same regardless of which install method wrote them (loose files, .exe, or .x2m), since all three end up recorded the same way.</summary>
+    /// <summary>Deletes exactly the files this mod is recorded as having written, then clears that record. Works the same regardless of which install method wrote them (loose files, .exe, .x2m, or merge-into-subfolder), since all of them end up recorded the same way.</summary>
     public void Disable(ModRecord mod, string moddedPath)
     {
         foreach (var relative in mod.InstalledRelativeFiles)
