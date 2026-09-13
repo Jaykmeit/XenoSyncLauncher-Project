@@ -2740,22 +2740,39 @@ public partial class MainWindow : Window
         return total;
     }
 
+    /// <summary>
+    /// Runs right after the XV2Patcher/Revamp/XV2INS component pipeline
+    /// finishes. _activityState is deliberately kept at Updating (and
+    /// Update/Run stay hidden) all the way through
+    /// EnsureMandatoryModsInstalledAsync below, not just while this method's
+    /// own progress panels are visible - that step can itself take a long
+    /// time (resolving a MediaFire link, a slow download, extracting a large
+    /// archive, or an installer the user has to click through), and setting
+    /// _activityState = Idle before it's done leaves a real window where a
+    /// second Update click (or the 30-minute Auto-Update timer) slips past
+    /// StartUpdate's "already updating" guard and fires a SECOND, overlapping
+    /// EnsureMandatoryModsInstalledAsync call - racing over the exact same
+    /// deterministic %TEMP% extraction paths as the one already running. This
+    /// is exactly what produced a mod that stayed stuck on "Extracting..."
+    /// indefinitely after Update was clicked a second time while the first
+    /// mod-install pass was still resolving/downloading/extracting.
+    /// </summary>
     private async Task FinishUpdateAsync()
     {
-        _activityState = LauncherActivityState.Idle;
-
         UpdateStatusPanel.Visibility = Visibility.Collapsed;
         UpdateProgressBar.Visibility = Visibility.Collapsed;
         UpdateBytesText.Visibility = Visibility.Collapsed;
         GameDownloadStatusPanel.Visibility = Visibility.Collapsed;
         PauseResumeButton.Visibility = Visibility.Collapsed;
-        UpdateButton.Visibility = Visibility.Visible;
-        RunButton.Visibility = Visibility.Visible;
 
-        AppendLog("Update finished.");
+        AppendLog("Update finished. Checking mods...");
         await LoadModsAsync();
         await EnsureMandatoryModsInstalledAsync();
         await RunLaunchInspectAsync();
+
+        _activityState = LauncherActivityState.Idle;
+        UpdateButton.Visibility = Visibility.Visible;
+        RunButton.Visibility = Visibility.Visible;
     }
 
     private void RunButton_Click(object sender, RoutedEventArgs e)
