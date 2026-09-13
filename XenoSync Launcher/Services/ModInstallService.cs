@@ -32,12 +32,15 @@ namespace XenoSyncLauncher.Services;
 ///     correct for mods that ship as plain drop-in files).
 ///
 /// For the .exe/.x2m cases we don't get a manifest of what was written, so a
-/// snapshot of the Modded folder's file list is taken before and after
-/// running the installer and diffed - the new files become
-/// mod.InstalledRelativeFiles, same as the loose-files case, so Disable()
-/// (and therefore Uninstall) works identically no matter which install
-/// method was used. See SnapshotDiffWithRetryAsync for why that diff is
-/// retried with a short delay rather than taken exactly once.
+/// snapshot of the Modded folder is taken before and after running the
+/// installer and diffed - the touched files become mod.InstalledRelativeFiles,
+/// same as the loose-files case, so Disable() (and therefore Uninstall) works
+/// identically no matter which install method was used. That diff counts a
+/// path as touched if it's new OR if it already existed but its last-write
+/// time changed - see DiffAddedOrChangedFiles for why a "compatibility"/patch
+/// mod that only overwrites existing files needs the latter half of that, and
+/// SnapshotDiffWithRetryAsync for why it's retried with a short delay rather
+/// than taken exactly once.
 ///
 /// TODO / known limitation: if two mods both write the same relative path,
 /// disabling whichever one wrote it last will delete the file even though
@@ -730,14 +733,55 @@ public class ModInstallService
         return (true, null);
     }
 
-    /// <summary>Relative paths of every file currently in moddedPath - used to diff what an opaque installer (.exe/.x2m via XV2INS) actually wrote, since neither hands back a manifest.</summary>
-    private static HashSet<string> SnapshotRelativeFiles(string moddedPath)
+    /// <summary>
+    /// Snapshot of every file currently in moddedPath, as relative path ->
+    /// last-write time (UTC). Used to detect what an opaque installer
+    /// (.exe/.x2m via XV2INS) actually did, since neither hands back a
+    /// manifest - tracking write times (not just which paths exist) matters
+    /// because some mods are "compatibility"/patch mods that deliberately
+    /// overwrite files a previous mod (or the base game) already put there,
+    /// rather than adding anything new. A plain "which paths are new"
+    /// diff sees zero changes for that kind of install and wrongly reports
+    /// it as having failed, even though it genuinely patched every file it
+    /// was supposed to - see DiffAddedOrChangedFiles.
+    /// </summary>
+    private static Dictionary<string, DateTime> SnapshotRelativeFiles(string moddedPath)
     {
-        if (!Directory.Exists(moddedPath)) return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        if (!Directory.Exists(moddedPath)) return result;
 
-        return Directory.GetFiles(moddedPath, "*", SearchOption.AllDirectories)
-            .Select(f => Path.GetRelativePath(moddedPath, f))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in Directory.GetFiles(moddedPath, "*", SearchOption.AllDirectories))
+        {
+            try
+            {
+                result[Path.GetRelativePath(moddedPath, file)] = System.IO.File.GetLastWriteTimeUtc(file);
+            }
+            catch
+            {
+                // Deleted/renamed mid-scan, or a transient access issue - skip it, not fatal.
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// A relative path counts as touched by the install if it either wasn't
+    /// there "before" at all, or was there but its last-write time changed -
+    /// covering both a mod that adds brand new files and one that overwrites
+    /// existing ones in place (a "compatibility"/patch mod).
+    /// </summary>
+    private static List<string> DiffAddedOrChangedFiles(Dictionary<string, DateTime> before, Dictionary<string, DateTime> after)
+    {
+        var touched = new List<string>();
+
+        foreach (var (relativePath, writeTime) in after)
+        {
+            if (!before.TryGetValue(relativePath, out var previousWriteTime) || previousWriteTime != writeTime)
+                touched.Add(relativePath);
+        }
+
+        return touched;
     }
 
     /// <summary>
@@ -757,11 +801,11 @@ public class ModInstallService
     /// window and wrongly report failure for an install that was actually
     /// about to succeed a moment later.
     /// </summary>
-    private static async Task<List<string>> SnapshotDiffWithRetryAsync(string moddedPath, HashSet<string> before, int maxAttempts = 4, int delayMs = 1000)
+    private static async Task<List<string>> SnapshotDiffWithRetryAsync(string moddedPath, Dictionary<string, DateTime> before, int maxAttempts = 4, int delayMs = 1000)
     {
         for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            var diff = SnapshotRelativeFiles(moddedPath).Except(before).ToList();
+            var diff = DiffAddedOrChangedFiles(before, SnapshotRelativeFiles(moddedPath));
             if (diff.Count > 0 || attempt == maxAttempts) return diff;
             await Task.Delay(delayMs);
         }
