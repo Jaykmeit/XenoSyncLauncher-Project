@@ -36,7 +36,8 @@ namespace XenoSyncLauncher.Services;
 /// running the installer and diffed - the new files become
 /// mod.InstalledRelativeFiles, same as the loose-files case, so Disable()
 /// (and therefore Uninstall) works identically no matter which install
-/// method was used.
+/// method was used. See SnapshotDiffWithRetryAsync for why that diff is
+/// retried with a short delay rather than taken exactly once.
 ///
 /// TODO / known limitation: if two mods both write the same relative path,
 /// disabling whichever one wrote it last will delete the file even though
@@ -291,7 +292,7 @@ public class ModInstallService
             }
         }
 
-        var newFiles = SnapshotRelativeFiles(moddedPath).Except(before).ToList();
+        var newFiles = await SnapshotDiffWithRetryAsync(moddedPath, before);
         if (newFiles.Count == 0)
         {
             const string error = "XV2INS closed, but no new files showed up for this batch - the install may not have completed.";
@@ -462,7 +463,7 @@ public class ModInstallService
             await process.WaitForExitAsync(token);
         }
 
-        var step1Files = SnapshotRelativeFiles(moddedPath).Except(beforeStep1).ToList();
+        var step1Files = await SnapshotDiffWithRetryAsync(moddedPath, beforeStep1);
         onStatus?.Invoke($"'{Path.GetFileName(installerExe)}' wrote {step1Files.Count} file(s): {string.Join(", ", step1Files.Take(20))}{(step1Files.Count > 20 ? ", ..." : "")}");
 
         var hstDir = Path.Combine(moddedPath, "data", "chara", "HST");
@@ -488,7 +489,7 @@ public class ModInstallService
             if (xv2insProcess is null) return (false, $"Couldn't start XV2INS for {mod.Title}.");
             await xv2insProcess.WaitForExitAsync(token);
         }
-        var step2Files = SnapshotRelativeFiles(moddedPath).Except(beforeStep2).ToList();
+        var step2Files = await SnapshotDiffWithRetryAsync(moddedPath, beforeStep2);
 
         var newFiles = keptStep1Files.Concat(step2Files).ToList();
         if (newFiles.Count == 0)
@@ -658,7 +659,7 @@ public class ModInstallService
             await process.WaitForExitAsync(token);
         }
 
-        var newFiles = SnapshotRelativeFiles(moddedPath).Except(before).ToList();
+        var newFiles = await SnapshotDiffWithRetryAsync(moddedPath, before);
         if (newFiles.Count == 0)
             return (false, $"{mod.Title}'s installer closed, but no new files showed up in the Modded folder - the install may not have completed.");
 
@@ -720,7 +721,7 @@ public class ModInstallService
             if (exeProcess is not null) await exeProcess.WaitForExitAsync(token);
         }
 
-        var newFiles = SnapshotRelativeFiles(moddedPath).Except(before).ToList();
+        var newFiles = await SnapshotDiffWithRetryAsync(moddedPath, before);
         if (newFiles.Count == 0)
             return (false, $"XV2INS closed, but no new files showed up for {mod.Title} - the install may not have completed.");
 
@@ -737,6 +738,35 @@ public class ModInstallService
         return Directory.GetFiles(moddedPath, "*", SearchOption.AllDirectories)
             .Select(f => Path.GetRelativePath(moddedPath, f))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Diffs the Modded folder against a "before" snapshot right after an
+    /// opaque installer (XV2INS, a mod's own .exe) reports having closed,
+    /// retrying with a short pause if nothing shows up yet before concluding
+    /// the install produced nothing.
+    ///
+    /// Confirmed against a real batched XV2INS run: the exact same batch
+    /// (same mods, same .x2m files, same everything) failed with "no new
+    /// files showed up" on one Update pass, then succeeded outright on the
+    /// very next Update pass with no other change - i.e. XV2INS's process
+    /// genuinely can report itself closed (WaitForExitAsync returns) a beat
+    /// before whatever it triggered actually finishes writing files to disk,
+    /// rather than the install having silently done nothing. Diffing exactly
+    /// once immediately after the process exits can catch that in-between
+    /// window and wrongly report failure for an install that was actually
+    /// about to succeed a moment later.
+    /// </summary>
+    private static async Task<List<string>> SnapshotDiffWithRetryAsync(string moddedPath, HashSet<string> before, int maxAttempts = 4, int delayMs = 1000)
+    {
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            var diff = SnapshotRelativeFiles(moddedPath).Except(before).ToList();
+            if (diff.Count > 0 || attempt == maxAttempts) return diff;
+            await Task.Delay(delayMs);
+        }
+
+        return new List<string>();
     }
 
     /// <summary>
