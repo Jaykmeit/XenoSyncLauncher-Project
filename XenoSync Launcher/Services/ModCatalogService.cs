@@ -144,7 +144,16 @@ public class ModCatalogService
             // mismatch, don't punish mods for moddedPath being unknown yet.
             bool needsUpdate = recordedEnabled && moddedPath is not null && !filesVerifiedPresent;
 
-            bool isActuallyInstalled = recordedEnabled;
+            // For XenoSyncCore (locked checkbox, not something the user
+            // toggles) the checkbox is meant to answer "is this genuinely
+            // installed right now", not "was this ever recorded as
+            // installed" - so it's gated on filesVerifiedPresent, same as
+            // Revamp Core below. Optional mods keep the old behavior
+            // (IsEnabled reflects the user's own toggle/intent, separate
+            // from NeedsUpdate) since that checkbox is interactive and
+            // flipping it off from under the user just because a repair
+            // hasn't run yet would be confusing, not honest.
+            bool isActuallyInstalled = category == ModCategory.XenoSyncCore ? filesVerifiedPresent : recordedEnabled;
 
             result.Add(new ModRecord
             {
@@ -223,7 +232,17 @@ public class ModCatalogService
             System.IO.File.Exists(Path.Combine(moddedPath, "data", "LB Mod Installer", "revamp xenoverse 2 project_revamp team.xml"));
 
         bool needsUpdate = recordedInstalled && !string.IsNullOrWhiteSpace(moddedPath) && !filesVerifiedPresent;
-        bool isActuallyInstalled = recordedInstalled;
+
+        // Revamp Core's checkbox is locked (never user-toggleable), so it's
+        // purely informational - it must answer "is Revamp genuinely
+        // installed right now", not "did installed-versions.json ever record
+        // a successful install". Gating on filesVerifiedPresent (instead of
+        // the raw bookkeeping flag) is what makes the checkbox honestly go
+        // unchecked - and, via NeedsUpdate below, Run correctly disabled -
+        // the moment Revamp's key file goes missing, instead of staying
+        // checked forever off a install that happened at some point in the
+        // past and may no longer reflect what's actually on disk.
+        bool isActuallyInstalled = filesVerifiedPresent;
 
         return new ModRecord
         {
