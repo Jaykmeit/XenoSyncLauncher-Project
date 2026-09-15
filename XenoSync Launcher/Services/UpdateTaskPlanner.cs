@@ -49,10 +49,24 @@ public class UpdateTaskPlanner
         AddComponentTasks(plan, idPrefix: "xv2patcher", displayName: "XV2Patcher",
             targetVersion: comparison.LatestXv2PatcherVersion, isUpToDate: comparison.Xv2PatcherUpToDate && !forceReinstall);
 
-        AddXv2InsPrerequisiteTasks(plan, settings, forceReinstall);
-
+        // Revamp is placed BEFORE the XV2INS prerequisite block on purpose.
+        // AddXv2InsPrerequisiteTasks's last task ("run-xv2ins-first-launch")
+        // launches XV2INS.exe and BLOCKS the whole pipeline until the user
+        // manually closes that window - on a forced Repair (which always
+        // re-triggers this block; see the alreadySetUp check below), that
+        // wait can be long or go unnoticed entirely, and every task queued
+        // AFTER it - which used to include all of Revamp's
+        // download/extract/install tasks - simply never got a chance to
+        // run. This is why Repair could silently finish "successfully" with
+        // Revamp's installer never having been launched at all: the pipeline
+        // was still parked waiting on the XV2INS window the whole time.
+        // Running Revamp first means it's already fully reinstalled by the
+        // time that blocking step is reached, regardless of how long the
+        // user takes to close XV2INS's window.
         AddComponentTasks(plan, idPrefix: "revamp", displayName: "Xenoverse 2 Revamp",
             targetVersion: comparison.LatestRevampVersion, isUpToDate: comparison.RevampUpToDate && !forceReinstall);
+
+        AddXv2InsPrerequisiteTasks(plan, settings, forceReinstall);
 
         return plan;
     }
