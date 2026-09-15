@@ -3,7 +3,8 @@ using System.Collections.Generic;
 namespace XenoSyncLauncher.Models;
 
 /// <summary>
-/// Local record for one mod, stored in mods.json. For XenoSyncCore/Optional
+/// Local record for one mod, stored in "&lt;ModdedPath&gt;/XenoSync/mods.json"
+/// (scoped per Modded folder - see ModCatalogService). For XenoSyncCore/Optional
 /// mods, most fields (Title/Description/PageUrl/DownloadUrl/Category) are
 /// refreshed from the hosted mods catalog on each load - only IsEnabled,
 /// RepositoryFolder, and InstalledRelativeFiles are this device's own state
@@ -26,6 +27,18 @@ public class ModRecord
     public string? ParentId { get; set; }
 
     public ModCategory Category { get; set; }
+
+    /// <summary>
+    /// Relative path (within the Modded folder) this mod's extracted content
+    /// must be merged INTO, instead of being copied straight to the Modded
+    /// root. Used for mods that ship a bare folder meant to be merged with an
+    /// existing one (e.g. InviernoCreations' Chi-Chi DYT pack, whose "CHI"
+    /// folder needs to be merged into the already-installed
+    /// "data/chara/CHI", not extracted as a top-level "CHI" folder next to
+    /// the game's own bin/data folders). Null for every mod that installs via
+    /// the normal x2m/exe/loose-files detection in ModInstallService.
+    /// </summary>
+    public string? MergeTargetSubfolder { get; set; }
 
     /// <summary>Always true for RevampCore/XenoSyncCore. User-controlled for Optional.</summary>
     public bool IsEnabled { get; set; }

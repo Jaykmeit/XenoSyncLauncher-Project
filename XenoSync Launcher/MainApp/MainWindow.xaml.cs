@@ -686,9 +686,19 @@ public partial class MainWindow : Window
         var pending = new List<ModRecord>();
         foreach (var record in _modRecordsById.Values)
         {
+            // Revamp Core is installed via the dedicated Revamp download/install
+            // pipeline (RunRevampDownloadTaskAsync/RunInstallTaskAsync in the
+            // Update pipeline), not through ModInstallService's DownloadUrls-based
+            // flow this method drives. Its ModRecord has no DownloadUrls at all,
+            // so if it's ever flagged NeedsUpdate (e.g. after a Repair, or its
+            // key file failing verification), including it here just produces a
+            // confusing "No download URL is configured for this mod" failure
+            // instead of the real reinstall it actually needs.
+            if (record.Category == ModCategory.RevampCore) continue;
+
             bool isXenoSyncCore = record.Category == ModCategory.XenoSyncCore;
             if (!isXenoSyncCore && !(record.IsEnabled && record.NeedsUpdate))
-                continue; // Optional/RevampCore mods only get touched here if they're both enabled and verified broken
+                continue; // Optional mods only get touched here if they're both enabled and verified broken
 
             bool alreadyInstalled = !string.IsNullOrWhiteSpace(record.RepositoryFolder) && record.InstalledRelativeFiles.Count > 0;
             if (isXenoSyncCore && alreadyInstalled && !record.NeedsUpdate)
@@ -719,7 +729,7 @@ public partial class MainWindow : Window
                 : $"Failed to install {record.Title}: {error}", success ? LogLevel.Info : LogLevel.Error);
         }
 
-        _modCatalogService.Save(_modRecordsById.Values.ToList());
+        _modCatalogService.Save(_settings.ModdedPath, _modRecordsById.Values.ToList());
     }
 
     private async void ModEntry_PropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
@@ -804,7 +814,7 @@ public partial class MainWindow : Window
                 }
             }
 
-            _modCatalogService.Save(_modRecordsById.Values.ToList());
+            _modCatalogService.Save(_settings.ModdedPath, _modRecordsById.Values.ToList());
             RefreshRunButtonState();
         }
         catch (Exception ex)
@@ -1254,12 +1264,44 @@ public partial class MainWindow : Window
                 AppendLog($"Controller DLL switched to {(_settings.UseDInput ? "DInput" : "XInput")}.");
             }
 
-            if (_settings.ForceReinstallOnNextUpdate)
-                AppendLog("Repair requested: XV2Patcher and Revamp will be reinstalled on the next Update.");
+            // Only act the moment the flag transitions to true - re-saving
+            // Settings while a repair is already pending (but hasn't run an
+            // Update yet) shouldn't re-mark every mod NeedsUpdate again on
+            // every single Save.
+            bool repairJustRequested = _settings.ForceReinstallOnNextUpdate && previousSettings?.ForceReinstallOnNextUpdate != true;
+            if (repairJustRequested)
+            {
+                MarkAllEnabledModsForReinstall();
+                AppendLog("Repair requested: XV2Patcher, Revamp, and every currently-enabled mod will be reinstalled on the next Update.", LogLevel.Warning);
+            }
 
             RefreshAutoUpdateTimerState();
             _ = RunLaunchInspectAsync();
         }
+    }
+
+    /// <summary>
+    /// Marks every currently-enabled mod (Optional and XenoSyncCore) as
+    /// NeedsUpdate, so the next Update's EnsureMandatoryModsInstalledAsync
+    /// pass reinstalls it from scratch instead of trusting its recorded
+    /// state. Used by Settings' "Repair on next Update" button. Revamp Core
+    /// is deliberately skipped here - it's excluded from
+    /// EnsureMandatoryModsInstalledAsync entirely (see that method) and is
+    /// instead reinstalled via LauncherSettings.ForceReinstallOnNextUpdate
+    /// (consumed by UpdateTaskPlanner), which the Repair button also sets.
+    /// </summary>
+    private void MarkAllEnabledModsForReinstall()
+    {
+        foreach (var record in _modRecordsById.Values.Where(m => m.IsEnabled && m.Category != ModCategory.RevampCore))
+        {
+            record.NeedsUpdate = true;
+            SyncModEntryNeedsUpdate(record.Id, true);
+        }
+
+        if (_settings?.ModdedPath is not null)
+            _modCatalogService.Save(_settings.ModdedPath, _modRecordsById.Values.ToList());
+
+        RefreshRunButtonState();
     }
 
     // ------------------------------------------------------------------
@@ -2740,22 +2782,39 @@ public partial class MainWindow : Window
         return total;
     }
 
+    /// <summary>
+    /// Runs right after the XV2Patcher/Revamp/XV2INS component pipeline
+    /// finishes. _activityState is deliberately kept at Updating (and
+    /// Update/Run stay hidden) all the way through
+    /// EnsureMandatoryModsInstalledAsync below, not just while this method's
+    /// own progress panels are visible - that step can itself take a long
+    /// time (resolving a MediaFire link, a slow download, extracting a large
+    /// archive, or an installer the user has to click through), and setting
+    /// _activityState = Idle before it's done leaves a real window where a
+    /// second Update click (or the 30-minute Auto-Update timer) slips past
+    /// StartUpdate's "already updating" guard and fires a SECOND, overlapping
+    /// EnsureMandatoryModsInstalledAsync call - racing over the exact same
+    /// deterministic %TEMP% extraction paths as the one already running. This
+    /// is exactly what produced a mod that stayed stuck on "Extracting..."
+    /// indefinitely after Update was clicked a second time while the first
+    /// mod-install pass was still resolving/downloading/extracting.
+    /// </summary>
     private async Task FinishUpdateAsync()
     {
-        _activityState = LauncherActivityState.Idle;
-
         UpdateStatusPanel.Visibility = Visibility.Collapsed;
         UpdateProgressBar.Visibility = Visibility.Collapsed;
         UpdateBytesText.Visibility = Visibility.Collapsed;
         GameDownloadStatusPanel.Visibility = Visibility.Collapsed;
         PauseResumeButton.Visibility = Visibility.Collapsed;
-        UpdateButton.Visibility = Visibility.Visible;
-        RunButton.Visibility = Visibility.Visible;
 
-        AppendLog("Update finished.");
+        AppendLog("Update finished. Checking mods...");
         await LoadModsAsync();
         await EnsureMandatoryModsInstalledAsync();
         await RunLaunchInspectAsync();
+
+        _activityState = LauncherActivityState.Idle;
+        UpdateButton.Visibility = Visibility.Visible;
+        RunButton.Visibility = Visibility.Visible;
     }
 
     private void RunButton_Click(object sender, RoutedEventArgs e)
