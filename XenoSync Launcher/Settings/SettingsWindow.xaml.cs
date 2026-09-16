@@ -1,3 +1,4 @@
+using System;
 using System.Globalization;
 using System.Windows;
 using Microsoft.Win32;
@@ -7,6 +8,10 @@ public partial class SettingsWindow : Window
 {
     /// <summary>Populated only when the user clicks "Save" (DialogResult == true).</summary>
     public LauncherSettings ResultSettings { get; private set; }
+
+    /// <summary>Set when the user confirms the "Repair on next Update" prompt this session. Merged into ForceReinstallOnNextUpdate on Save.</summary>
+    private bool _repairRequested;
+
     public SettingsWindow(LauncherSettings currentSettings)
     {
         InitializeComponent();
@@ -21,6 +26,15 @@ public partial class SettingsWindow : Window
             CredentialsLoginRadio.IsChecked = true;
         else
             QrLoginRadio.IsChecked = true;
+
+        // If a repair was already scheduled from a previous Settings visit
+        // (Saved but no Update run yet since), reflect that on reopen instead
+        // of silently losing the "still pending" indicator.
+        if (currentSettings.ForceReinstallOnNextUpdate)
+        {
+            RepairStatusText.Text = "A repair is already scheduled for the next Update.";
+            RepairStatusText.Visibility = Visibility.Visible;
+        }
     }
     private void BrowseVanillaButton_Click(object sender, RoutedEventArgs e)
     {
@@ -68,6 +82,32 @@ public partial class SettingsWindow : Window
         new XV2PatcherFlagsWindow(ModdedPathTextBox.Text) { Owner = this }.ShowDialog();
     }
 
+    /// <summary>
+    /// Schedules a full repair for the next Update: XV2Patcher/Revamp get
+    /// forced through UpdateTaskPlanner (via ForceReinstallOnNextUpdate,
+    /// merged into ResultSettings on Save), and every currently-enabled mod
+    /// gets marked NeedsUpdate so MainWindow's
+    /// EnsureMandatoryModsInstalledAsync reinstalls it too - see
+    /// MainWindow.MarkAllEnabledModsForReinstall, which actually applies
+    /// that second half once this window reports back a newly-set
+    /// ForceReinstallOnNextUpdate. Only takes effect once Save is also
+    /// clicked - closing via Cancel after this discards it, matching every
+    /// other setting in this window.
+    /// </summary>
+    private void RepairButton_Click(object sender, RoutedEventArgs e)
+    {
+        var result = MessageBox.Show(this,
+            "This will force XV2Patcher, Revamp, and every currently-enabled mod to be reinstalled the next time you click Update. " +
+            "This can take a while depending on your connection. Continue?",
+            "Repair on next Update", MessageBoxButton.YesNo, MessageBoxImage.Question);
+
+        if (result != MessageBoxResult.Yes) return;
+
+        _repairRequested = true;
+        RepairStatusText.Text = "Repair scheduled - click Save, then Update, to apply it.";
+        RepairStatusText.Visibility = Visibility.Visible;
+    }
+
     private void SaveButton_Click(object sender, RoutedEventArgs e)
     {
         double speedLimit = double.TryParse(SpeedLimitTextBox.Text, NumberStyles.Any, CultureInfo.InvariantCulture, out var parsed)
@@ -76,7 +116,7 @@ public partial class SettingsWindow : Window
         ResultSettings = new LauncherSettings
         {
             VanillaPath = string.IsNullOrWhiteSpace(VanillaPathTextBox.Text) ? null : VanillaPathTextBox.Text,
-            ModdedPath = ModdedPathTextBox.Text,
+            ModdedPath = string.IsNullOrWhiteSpace(ModdedPathTextBox.Text) ? null : ModdedPathTextBox.Text,
             InstallType = ResultSettings.InstallType,
             SpeedLimitMbps = speedLimit,
             AutoUpdateEnabled = AutoUpdateCheckBox.IsChecked == true,
@@ -87,7 +127,9 @@ public partial class SettingsWindow : Window
             GameAppId = ResultSettings.GameAppId,
             GameDepotId = ResultSettings.GameDepotId,
             NeedsGameDownload = ResultSettings.NeedsGameDownload,
-            RequiredManifestId = ResultSettings.RequiredManifestId
+            RequiredManifestId = ResultSettings.RequiredManifestId,
+            ForceReinstallOnNextUpdate = _repairRequested || ResultSettings.ForceReinstallOnNextUpdate,
+            InstallDirectory = ResultSettings.InstallDirectory
         };
         DialogResult = true;
         Close();
@@ -97,6 +139,6 @@ public partial class SettingsWindow : Window
         DialogResult = false;
         Close();
     }
-    /// <summary>Botón X de la barra de título personalizada: mismo comportamiento que Cancel.</summary>
+    /// <summary>BotÃ³n X de la barra de tÃ­tulo personalizada: mismo comportamiento que Cancel.</summary>
     private void BtnClose_Click(object sender, RoutedEventArgs e) => CancelButton_Click(sender, e);
 }

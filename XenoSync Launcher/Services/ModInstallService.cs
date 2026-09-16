@@ -18,6 +18,12 @@ namespace XenoSyncLauncher.Services;
 /// so they live alongside the actual game install and can be reused for a
 /// later Reinstall without re-downloading). What happens next depends on
 /// what's actually inside:
+///   - mod.MergeTargetSubfolder is set -> merged into that existing
+///     subfolder of the Modded folder instead of the root (see
+///     InstallMergeIntoSubfolder) - used for mods whose real install
+///     instructions are "drag this folder's contents into the matching
+///     folder that's already there" (e.g. InviernoCreations' Chi-Chi DYT
+///     pack, merged into "data/chara/CHI").
 ///   - .x2m file(s) present  -> installed via XV2INS (requires XV2Patcher
 ///     already installed - XV2INS relies on files it sets up).
 ///   - .exe file(s), no .x2m -> run as a self-installer.
@@ -26,11 +32,15 @@ namespace XenoSyncLauncher.Services;
 ///     correct for mods that ship as plain drop-in files).
 ///
 /// For the .exe/.x2m cases we don't get a manifest of what was written, so a
-/// snapshot of the Modded folder's file list is taken before and after
-/// running the installer and diffed - the new files become
-/// mod.InstalledRelativeFiles, same as the loose-files case, so Disable()
-/// (and therefore Uninstall) works identically no matter which install
-/// method was used.
+/// snapshot of the Modded folder is taken before and after running the
+/// installer and diffed - the touched files become mod.InstalledRelativeFiles,
+/// same as the loose-files case, so Disable() (and therefore Uninstall) works
+/// identically no matter which install method was used. That diff counts a
+/// path as touched if it's new OR if it already existed but its last-write
+/// time changed - see DiffAddedOrChangedFiles for why a "compatibility"/patch
+/// mod that only overwrites existing files needs the latter half of that, and
+/// SnapshotDiffWithRetryAsync for why it's retried with a short delay rather
+/// than taken exactly once.
 ///
 /// TODO / known limitation: if two mods both write the same relative path,
 /// disabling whichever one wrote it last will delete the file even though
@@ -134,9 +144,10 @@ public class ModInstallService
     /// Extracts every mod first, then installs them - grouping every mod
     /// whose install method turns out to be X2M into a single shared XV2INS
     /// invocation (all their .x2m files passed as one combined argument
-    /// list) instead of one XV2INS confirmation per mod. Loose-files and
-    /// .exe-installer mods are still installed one at a time since batching
-    /// only helps with XV2INS's own per-launch confirmation dialog.
+    /// list) instead of one XV2INS confirmation per mod. Loose-files,
+    /// merge-into-subfolder, and .exe-installer mods are still installed one
+    /// at a time since batching only helps with XV2INS's own per-launch
+    /// confirmation dialog.
     ///
     /// Trade-off: XV2INS doesn't tell us which resulting file came from
     /// which .x2m, so a single before/after snapshot around the whole batch
@@ -168,6 +179,19 @@ public class ModInstallService
                 if (IsNightContonCity(mod))
                 {
                     results[mod.Id] = await InstallNightContonCityAsync(mod, mod.RepositoryFolder!, moddedPath, onStatus, cancellationToken);
+                    continue;
+                }
+
+                // Catalog-declared "merge this into an existing subfolder"
+                // mods (e.g. Chi-Chi's DYT pack, merged into
+                // data/chara/CHI) bypass the x2m/exe/loose-files detection
+                // entirely - the catalog already says exactly how they need
+                // to be installed, so there's nothing to infer from what's
+                // inside the extracted folder.
+                if (!string.IsNullOrWhiteSpace(mod.MergeTargetSubfolder))
+                {
+                    onStatus?.Invoke($"Merging {mod.Title} into '{mod.MergeTargetSubfolder}'...");
+                    results[mod.Id] = InstallMergeIntoSubfolder(mod, mod.RepositoryFolder!, moddedPath);
                     continue;
                 }
 
@@ -271,7 +295,7 @@ public class ModInstallService
             }
         }
 
-        var newFiles = SnapshotRelativeFiles(moddedPath).Except(before).ToList();
+        var newFiles = await SnapshotDiffWithRetryAsync(moddedPath, before);
         if (newFiles.Count == 0)
         {
             const string error = "XV2INS closed, but no new files showed up for this batch - the install may not have completed.";
@@ -292,8 +316,17 @@ public class ModInstallService
         return results;
     }
 
-    /// <summary>Which install method a mod's extracted files call for, detected by what's actually in them (see class docs).</summary>
-    public enum ModInstallMethod { LooseFiles, Executable, X2M }
+    /// <summary>
+    /// Which install method a mod's extracted files call for. LooseFiles/
+    /// Executable/X2M are detected by what's actually inside the extracted
+    /// folder (see DetectInstallMethod) - MergeIntoSubfolder is never
+    /// returned by that detection; it's decided directly from the catalog's
+    /// ModRecord.MergeTargetSubfolder before DetectInstallMethod is even
+    /// called (see InstallExtractedModAsync/InstallBatchAsync), since there's
+    /// nothing about the extracted content itself that reliably signals
+    /// "merge me into an existing subfolder" the way an .x2m or .exe does.
+    /// </summary>
+    public enum ModInstallMethod { LooseFiles, Executable, X2M, MergeIntoSubfolder }
 
     /// <summary>Looks at what's inside an already-extracted mod folder to decide how it needs to be installed.</summary>
     public static ModInstallMethod DetectInstallMethod(string extractedFolder, out List<string> installerFiles)
@@ -331,6 +364,16 @@ public class ModInstallService
         // Halloween-asset-filtered install.
         if (IsNightContonCity(mod))
             return await InstallNightContonCityAsync(mod, extractedFolder, moddedPath, onStatus, cancellationToken);
+
+        // Catalog-declared "merge this into an existing subfolder" mods
+        // (e.g. Chi-Chi's DYT pack, merged into data/chara/CHI) bypass the
+        // x2m/exe/loose-files detection entirely - see ModInstallMethod's
+        // remarks on why this can't be inferred from the extracted content.
+        if (!string.IsNullOrWhiteSpace(mod.MergeTargetSubfolder))
+        {
+            onStatus?.Invoke($"Merging {mod.Title} into '{mod.MergeTargetSubfolder}'...");
+            return InstallMergeIntoSubfolder(mod, extractedFolder, moddedPath);
+        }
 
         var method = DetectInstallMethod(extractedFolder, out var installerFiles);
 
@@ -423,7 +466,7 @@ public class ModInstallService
             await process.WaitForExitAsync(token);
         }
 
-        var step1Files = SnapshotRelativeFiles(moddedPath).Except(beforeStep1).ToList();
+        var step1Files = await SnapshotDiffWithRetryAsync(moddedPath, beforeStep1);
         onStatus?.Invoke($"'{Path.GetFileName(installerExe)}' wrote {step1Files.Count} file(s): {string.Join(", ", step1Files.Take(20))}{(step1Files.Count > 20 ? ", ..." : "")}");
 
         var hstDir = Path.Combine(moddedPath, "data", "chara", "HST");
@@ -449,7 +492,7 @@ public class ModInstallService
             if (xv2insProcess is null) return (false, $"Couldn't start XV2INS for {mod.Title}.");
             await xv2insProcess.WaitForExitAsync(token);
         }
-        var step2Files = SnapshotRelativeFiles(moddedPath).Except(beforeStep2).ToList();
+        var step2Files = await SnapshotDiffWithRetryAsync(moddedPath, beforeStep2);
 
         var newFiles = keptStep1Files.Concat(step2Files).ToList();
         if (newFiles.Count == 0)
@@ -539,6 +582,68 @@ public class ModInstallService
         return (true, null);
     }
 
+    /// <summary>
+    /// Installs a mod by merging its extracted content into an existing
+    /// subfolder of the Modded folder (mod.MergeTargetSubfolder), instead of
+    /// dropping the raw extracted files at the Modded root or trying to
+    /// infer an x2m/exe/loose-files method from what's inside. Used for mods
+    /// whose real, manual install instructions amount to "drag this folder's
+    /// contents into the matching folder that's already there" - e.g.
+    /// InviernoCreations' Chi-Chi DYT pack, whose "CHI" folder needs to be
+    /// merged into the already-installed "data/chara/CHI", not extracted as
+    /// a sibling "CHI" folder next to the game's own bin/data.
+    ///
+    /// If the extracted archive wraps everything in a single top-level
+    /// folder (a common "the whole mod lives inside one folder" archive
+    /// layout), that wrapper is flattened first - mirroring the same
+    /// flattening MainWindow's own install pipeline applies to Revamp/XV2INS
+    /// - so the mod's actual payload lands directly under
+    /// MergeTargetSubfolder instead of one level too deep.
+    /// </summary>
+    private static (bool Success, string? ErrorMessage) InstallMergeIntoSubfolder(ModRecord mod, string extractedFolder, string moddedPath)
+    {
+        var targetSubfolder = mod.MergeTargetSubfolder!.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
+        var targetDir = Path.Combine(moddedPath, targetSubfolder);
+        Directory.CreateDirectory(targetDir);
+
+        var source = FlattenSingleWrapperFolder(extractedFolder);
+
+        var written = new List<string>();
+        foreach (var file in Directory.GetFiles(source, "*", SearchOption.AllDirectories))
+        {
+            var relativeToSource = Path.GetRelativePath(source, file);
+            var destination = Path.Combine(targetDir, relativeToSource);
+            var relativeToModded = Path.GetRelativePath(moddedPath, destination);
+
+            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+            System.IO.File.Copy(file, destination, overwrite: true);
+            written.Add(relativeToModded);
+        }
+
+        if (written.Count == 0)
+            return (false, $"{mod.Title}'s extracted files were empty - nothing was merged into '{targetSubfolder}'.");
+
+        mod.InstalledRelativeFiles = written;
+        mod.IsEnabled = true;
+        return (true, null);
+    }
+
+    /// <summary>
+    /// If <paramref name="dir"/> contains exactly one entry and it's a
+    /// subfolder (the typical "everything wrapped in one top folder" archive
+    /// layout), returns that subfolder's path instead, so callers merge its
+    /// *contents* rather than re-creating that wrapper folder inside the
+    /// destination. Otherwise returns <paramref name="dir"/> unchanged.
+    /// </summary>
+    private static string FlattenSingleWrapperFolder(string dir)
+    {
+        var entries = Directory.GetFileSystemEntries(dir);
+        if (entries.Length == 1 && Directory.Exists(entries[0]))
+            return entries[0];
+
+        return dir;
+    }
+
     /// <summary>Runs a mod's self-installer .exe(s), then diffs the Modded folder's file list before/after to learn what it actually wrote (installers don't hand back a manifest).</summary>
     private async Task<(bool Success, string? ErrorMessage)> InstallViaExecutableAsync(
         ModRecord mod, List<string> exeFiles, string moddedPath, Action<string>? onStatus, CancellationToken token)
@@ -557,7 +662,7 @@ public class ModInstallService
             await process.WaitForExitAsync(token);
         }
 
-        var newFiles = SnapshotRelativeFiles(moddedPath).Except(before).ToList();
+        var newFiles = await SnapshotDiffWithRetryAsync(moddedPath, before);
         if (newFiles.Count == 0)
             return (false, $"{mod.Title}'s installer closed, but no new files showed up in the Modded folder - the install may not have completed.");
 
@@ -619,7 +724,7 @@ public class ModInstallService
             if (exeProcess is not null) await exeProcess.WaitForExitAsync(token);
         }
 
-        var newFiles = SnapshotRelativeFiles(moddedPath).Except(before).ToList();
+        var newFiles = await SnapshotDiffWithRetryAsync(moddedPath, before);
         if (newFiles.Count == 0)
             return (false, $"XV2INS closed, but no new files showed up for {mod.Title} - the install may not have completed.");
 
@@ -628,14 +733,84 @@ public class ModInstallService
         return (true, null);
     }
 
-    /// <summary>Relative paths of every file currently in moddedPath - used to diff what an opaque installer (.exe/.x2m via XV2INS) actually wrote, since neither hands back a manifest.</summary>
-    private static HashSet<string> SnapshotRelativeFiles(string moddedPath)
+    /// <summary>
+    /// Snapshot of every file currently in moddedPath, as relative path ->
+    /// last-write time (UTC). Used to detect what an opaque installer
+    /// (.exe/.x2m via XV2INS) actually did, since neither hands back a
+    /// manifest - tracking write times (not just which paths exist) matters
+    /// because some mods are "compatibility"/patch mods that deliberately
+    /// overwrite files a previous mod (or the base game) already put there,
+    /// rather than adding anything new. A plain "which paths are new"
+    /// diff sees zero changes for that kind of install and wrongly reports
+    /// it as having failed, even though it genuinely patched every file it
+    /// was supposed to - see DiffAddedOrChangedFiles.
+    /// </summary>
+    private static Dictionary<string, DateTime> SnapshotRelativeFiles(string moddedPath)
     {
-        if (!Directory.Exists(moddedPath)) return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        if (!Directory.Exists(moddedPath)) return result;
 
-        return Directory.GetFiles(moddedPath, "*", SearchOption.AllDirectories)
-            .Select(f => Path.GetRelativePath(moddedPath, f))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in Directory.GetFiles(moddedPath, "*", SearchOption.AllDirectories))
+        {
+            try
+            {
+                result[Path.GetRelativePath(moddedPath, file)] = System.IO.File.GetLastWriteTimeUtc(file);
+            }
+            catch
+            {
+                // Deleted/renamed mid-scan, or a transient access issue - skip it, not fatal.
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// A relative path counts as touched by the install if it either wasn't
+    /// there "before" at all, or was there but its last-write time changed -
+    /// covering both a mod that adds brand new files and one that overwrites
+    /// existing ones in place (a "compatibility"/patch mod).
+    /// </summary>
+    private static List<string> DiffAddedOrChangedFiles(Dictionary<string, DateTime> before, Dictionary<string, DateTime> after)
+    {
+        var touched = new List<string>();
+
+        foreach (var (relativePath, writeTime) in after)
+        {
+            if (!before.TryGetValue(relativePath, out var previousWriteTime) || previousWriteTime != writeTime)
+                touched.Add(relativePath);
+        }
+
+        return touched;
+    }
+
+    /// <summary>
+    /// Diffs the Modded folder against a "before" snapshot right after an
+    /// opaque installer (XV2INS, a mod's own .exe) reports having closed,
+    /// retrying with a short pause if nothing shows up yet before concluding
+    /// the install produced nothing.
+    ///
+    /// Confirmed against a real batched XV2INS run: the exact same batch
+    /// (same mods, same .x2m files, same everything) failed with "no new
+    /// files showed up" on one Update pass, then succeeded outright on the
+    /// very next Update pass with no other change - i.e. XV2INS's process
+    /// genuinely can report itself closed (WaitForExitAsync returns) a beat
+    /// before whatever it triggered actually finishes writing files to disk,
+    /// rather than the install having silently done nothing. Diffing exactly
+    /// once immediately after the process exits can catch that in-between
+    /// window and wrongly report failure for an install that was actually
+    /// about to succeed a moment later.
+    /// </summary>
+    private static async Task<List<string>> SnapshotDiffWithRetryAsync(string moddedPath, Dictionary<string, DateTime> before, int maxAttempts = 4, int delayMs = 1000)
+    {
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            var diff = DiffAddedOrChangedFiles(before, SnapshotRelativeFiles(moddedPath));
+            if (diff.Count > 0 || attempt == maxAttempts) return diff;
+            await Task.Delay(delayMs);
+        }
+
+        return new List<string>();
     }
 
     /// <summary>
@@ -679,7 +854,7 @@ public class ModInstallService
         return partFiles.OrderBy(f => f, StringComparer.OrdinalIgnoreCase).First();
     }
 
-    /// <summary>Deletes exactly the files this mod is recorded as having written, then clears that record. Works the same regardless of which install method wrote them (loose files, .exe, or .x2m), since all three end up recorded the same way.</summary>
+    /// <summary>Deletes exactly the files this mod is recorded as having written, then clears that record. Works the same regardless of which install method wrote them (loose files, .exe, .x2m, or merge-into-subfolder), since all of them end up recorded the same way.</summary>
     public void Disable(ModRecord mod, string moddedPath)
     {
         foreach (var relative in mod.InstalledRelativeFiles)

@@ -86,7 +86,7 @@
             <RowDefinition Height="56"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="150"/>
-            <RowDefinition Height="135"/>
+            <RowDefinition Height="112"/>
         </Grid.RowDefinitions>
 
         <!-- Top bar: title, Live/Not Found indicator, Settings gear, controles de ventana -->
@@ -128,27 +128,36 @@
                         </StackPanel>
 
                     </Border>
+                </Grid>
 
+                <!-- Version label + Settings gear: anchored to the window's RIGHT
+                     edge (as a sibling of the 20px-margin content Grid above, so it
+                     tracks the FULL window width) instead of a fixed left-pixel
+                     offset. A fixed "Margin=1133,..." only ever lined up correctly
+                     for the default 1320px window width - it drifted out of place
+                     whenever the window was maximized (wider) and could slide the
+                     Settings button off-screen entirely once the window was resized
+                     narrower than that. Margin.Right (146) clears the three 42px-wide
+                     window-control buttons plus a little breathing room. -->
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center"
+                            Margin="0,0,146,0">
                     <TextBlock x:Name="LauncherVersionText"
                        Text="v0.1"
                        Foreground="{StaticResource BrushTextSecondary}"
                        FontSize="11"
                        VerticalAlignment="Center"
-                       HorizontalAlignment="Left"
-                       Margin="1109,0,0,0"/>
+                       Margin="0,0,12,0"/>
 
                     <Button x:Name="SettingsButton"
                     Content="&#9881;"
                     Width="36"
                     Height="36"
-                    HorizontalAlignment="Left"
                     FontSize="16"
-                    Margin="1133,10,0,9"
                     Style="{StaticResource WizardButton}"
                     Click="SettingsButton_Click"
                     ToolTip="Settings"
                     WindowChrome.IsHitTestVisibleInChrome="True"/>
-                </Grid>
+                </StackPanel>
 
                 <!-- Controles de ventana: minimizar / maximizar-restaurar / cerrar,
                      pegados a la esquina superior derecha, fuera del margen de 20px
@@ -178,9 +187,9 @@
         <!-- Main content: mod tree + details / Launch Inspect sidebar -->
         <Grid Grid.Row="1" Margin="20,15,20,10">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="2*"/>
+                <ColumnDefinition Width="1.7*"/>
                 <ColumnDefinition Width="15"/>
-                <ColumnDefinition Width="2*"/>
+                <ColumnDefinition Width="2.3*"/>
                 <ColumnDefinition Width="15"/>
                 <ColumnDefinition Width="1*"/>
             </Grid.ColumnDefinitions>
