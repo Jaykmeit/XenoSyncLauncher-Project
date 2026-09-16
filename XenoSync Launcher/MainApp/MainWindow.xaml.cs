@@ -1281,26 +1281,42 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Marks every currently-enabled mod (Optional and XenoSyncCore) as
-    /// NeedsUpdate, so the next Update's EnsureMandatoryModsInstalledAsync
-    /// pass reinstalls it from scratch instead of trusting its recorded
-    /// state. Used by Settings' "Repair on next Update" button. Revamp Core
-    /// is deliberately skipped here - it's excluded from
+    /// Wipes every currently-enabled mod's actually-installed files (same
+    /// removal ModInstallService.Disable does, regardless of whether they
+    /// were originally placed as loose files, via a self-extracting .exe, or
+    /// via XV2INS/.x2m - InstalledRelativeFiles is tracked identically no
+    /// matter which install method wrote them) and marks it NeedsUpdate, so
+    /// the next Update's EnsureMandatoryModsInstalledAsync pass reinstalls
+    /// it truly from scratch instead of merging fresh files on top of
+    /// whatever the old install left behind. This matters most for .x2m
+    /// mods: re-running XV2INS on top of already-installed content can
+    /// conflict rather than cleanly overwrite, which is why a Repair needs
+    /// the old files gone first, not just re-copied over.
+    ///
+    /// Disable() also flips IsEnabled off, which would normally hide the mod
+    /// from EnsureMandatoryModsInstalledAsync's Optional-mod pending check
+    /// (it requires IsEnabled AND NeedsUpdate) - IsEnabled is restored to
+    /// true right after so the mod stays "on" (just pending reinstall)
+    /// instead of silently disappearing from what Repair is supposed to fix.
+    ///
+    /// Revamp Core is deliberately skipped here - it's excluded from
     /// EnsureMandatoryModsInstalledAsync entirely (see that method) and is
     /// instead reinstalled via LauncherSettings.ForceReinstallOnNextUpdate
     /// (consumed by UpdateTaskPlanner), which the Repair button also sets.
     /// </summary>
     private void MarkAllEnabledModsForReinstall()
     {
-        foreach (var record in _modRecordsById.Values.Where(m => m.IsEnabled && m.Category != ModCategory.RevampCore))
+        if (_settings?.ModdedPath is null) return;
+
+        foreach (var record in _modRecordsById.Values.Where(m => m.IsEnabled && m.Category != ModCategory.RevampCore).ToList())
         {
+            _modInstallService.Disable(record, _settings.ModdedPath);
+            record.IsEnabled = true; // Disable() turns this off - Repair keeps it "on", just pending reinstall
             record.NeedsUpdate = true;
             SyncModEntryNeedsUpdate(record.Id, true);
         }
 
-        if (_settings?.ModdedPath is not null)
-            _modCatalogService.Save(_settings.ModdedPath, _modRecordsById.Values.ToList());
-
+        _modCatalogService.Save(_settings.ModdedPath, _modRecordsById.Values.ToList());
         RefreshRunButtonState();
     }
 
