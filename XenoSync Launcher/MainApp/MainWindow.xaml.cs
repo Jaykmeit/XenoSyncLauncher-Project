@@ -1303,6 +1303,8 @@ public partial class MainWindow : Window
     /// EnsureMandatoryModsInstalledAsync entirely (see that method) and is
     /// instead reinstalled via LauncherSettings.ForceReinstallOnNextUpdate
     /// (consumed by UpdateTaskPlanner), which the Repair button also sets.
+    /// Its own stale "installed" marker is separately cleared by
+    /// ResetRevampInstallMarker right before its Update tasks run.
     /// </summary>
     private void MarkAllEnabledModsForReinstall()
     {
@@ -1320,6 +1322,48 @@ public partial class MainWindow : Window
         RefreshRunButtonState();
     }
 
+    /// <summary>
+    /// Deletes Revamp's own "installed" marker - the "data/LB Mod Installer"
+    /// folder IsRevampInstalledCorrectly checks for - right before a forced
+    /// Repair re-runs Revamp's installer. Revamp Core has no tracked file
+    /// list the way other mods do (see MarkAllEnabledModsForReinstall, which
+    /// deliberately skips it), so its stale marker from the PREVIOUS install
+    /// is never otherwise cleared.
+    ///
+    /// Left in place, that stale marker makes RunInstallTaskAsync's post-copy
+    /// verification (IsRevampInstalledCorrectly) trivially pass even if this
+    /// repair's own installer run never actually found/launched the LB
+    /// Installer .exe at all (e.g. it wasn't at the top level of the freshly
+    /// extracted archive) - the deep, AllDirectories fallback search for a
+    /// nested installer only runs when that verification fails, so a stale
+    /// marker silently skips that fallback too. This is the most likely
+    /// explanation for "Repair says it succeeded but Revamp's installer
+    /// never actually popped up": the repair quietly did nothing for Revamp
+    /// while the rest of the pipeline (mods, XV2Patcher) worked correctly.
+    ///
+    /// Deliberately does NOT touch anything else under the Modded folder -
+    /// Revamp's actual game-content files aren't tracked anywhere the way
+    /// other mods' InstalledRelativeFiles are, and for an OverVanilla install
+    /// the Modded folder IS the Vanilla Steam folder, so a broader cleanup
+    /// here risks deleting files that don't belong to Revamp at all.
+    /// </summary>
+    private void ResetRevampInstallMarker(string moddedPath)
+    {
+        try
+        {
+            var lbInstallerDir = Path.Combine(moddedPath, "data", "LB Mod Installer");
+            if (Directory.Exists(lbInstallerDir))
+            {
+                Directory.Delete(lbInstallerDir, recursive: true);
+                AppendLog("Repair: cleared Revamp's previous install marker so it gets genuinely reinstalled and verified.");
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Repair: couldn't clear Revamp's previous install marker: {ex.Message}", LogLevel.Warning);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Update pipeline
     // ------------------------------------------------------------------
@@ -1334,11 +1378,21 @@ public partial class MainWindow : Window
 
         _updateTasks = _updateTaskPlanner.BuildPlan(_lastComparison, _settings);
 
+        bool wasForceReinstall = _settings?.ForceReinstallOnNextUpdate == true;
+
         if (_settings is { ForceReinstallOnNextUpdate: true })
         {
             _settings.ForceReinstallOnNextUpdate = false;
             _settingsService.Save(_settings);
         }
+
+        // See ResetRevampInstallMarker's own remarks for the full reasoning:
+        // a forced Repair re-runs Revamp's installer, but nothing else
+        // clears the file that marks it "installed" from the PREVIOUS run,
+        // which can make the repair silently no-op for Revamp specifically
+        // while everything else (XV2Patcher, mods) reinstalls correctly.
+        if (wasForceReinstall && _settings?.ModdedPath is not null)
+            ResetRevampInstallMarker(_settings.ModdedPath);
 
         if (_updateTasks.Count == 0)
         {
@@ -2408,7 +2462,7 @@ public partial class MainWindow : Window
                     // before merging anything - IsRevampInstalledCorrectly
                     // below still verifies the result either way, regardless
                     // of which of these two paths actually placed the files.
-                    var installerExe = Directory.GetFiles(effectiveSourceDir, "*.exe", SearchOption.TopDirectoryOnly).FirstOrDefault();
+                    var installerExe = Directory.GetFiles(effectiveSourceDir, "*.exe", SearchOption.AllDirectories).FirstOrDefault();
                     if (installerExe is not null)
                     {
                         AppendLog($"Running Revamp's installer: {Path.GetFileName(installerExe)}... " +
@@ -2420,6 +2474,12 @@ public partial class MainWindow : Window
                             AppendLog($"Failed to run Revamp's installer: {installerError}", LogLevel.Error);
                             return false;
                         }
+                    }
+                    else
+                    {
+                        AppendLog("Couldn't find an .exe installer anywhere inside Revamp's extracted archive - " +
+                                  "merging its extracted files directly instead. If Revamp still isn't showing as " +
+                                  "installed afterwards, its archive layout may have changed.", LogLevel.Warning);
                     }
                 }
 
