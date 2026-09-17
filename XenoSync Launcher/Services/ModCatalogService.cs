@@ -157,6 +157,11 @@ public class ModCatalogService
             // ever got a chance to actually reinstall anything. Once a
             // (re)install genuinely succeeds, EnsureMandatoryModsInstalledAsync
             // persists NeedsUpdate=false itself, so this doesn't loop forever.
+            //
+            // This carry-forward is safe here (unlike Revamp Core below)
+            // because EnsureMandatoryModsInstalledAsync DOES eventually
+            // process and clear NeedsUpdate for every Optional/XenoSyncCore
+            // mod - there's a real consumer that terminates the loop.
             bool needsUpdate = (recordedEnabled && moddedPath is not null && !filesVerifiedPresent) || existing?.NeedsUpdate == true;
 
             // For XenoSyncCore (locked checkbox, not something the user
@@ -246,16 +251,22 @@ public class ModCatalogService
         bool filesVerifiedPresent = recordedInstalled && !string.IsNullOrWhiteSpace(moddedPath) &&
             System.IO.File.Exists(Path.Combine(moddedPath, "data", "LB Mod Installer", "revamp xenoverse 2 project_revamp team.xml"));
 
-        // OR'd with the persisted existing.NeedsUpdate for the same reason as
-        // the Optional/XenoSyncCore loop above: a Repair can set this true
-        // deliberately even while the old key file is still sitting there
-        // from a previous install, and that intent must survive a reload
-        // that happens before the reinstall actually runs. Revamp Core is
-        // currently skipped by EnsureMandatoryModsInstalledAsync (it has no
-        // DownloadUrls - see that method), so this mainly keeps the UI/Run
-        // button honest about a pending Revamp repair rather than driving a
-        // reinstall by itself.
-        bool needsUpdate = (recordedInstalled && !string.IsNullOrWhiteSpace(moddedPath) && !filesVerifiedPresent) || existing?.NeedsUpdate == true;
+        // Deliberately NOT OR'd with the persisted existing.NeedsUpdate, unlike
+        // the Optional/XenoSyncCore loop above. Revamp Core is skipped
+        // entirely by EnsureMandatoryModsInstalledAsync (it has no
+        // DownloadUrls - see that method), so nothing ever consumes a
+        // persisted NeedsUpdate=true for it and clears it back to false -
+        // OR'ing it in here made it stick forever the moment it was ever set
+        // (including surviving a full app restart, since it's read straight
+        // back out of mods.json every load), which is exactly what produced
+        // "Run stays disabled / mods 'couldn't be reinstalled'" indefinitely
+        // even after a Repair had genuinely finished successfully. A pending
+        // Repair's intent is instead captured by ResetRevampInstallMarker
+        // (called right before Revamp's Update tasks run), which deletes the
+        // old key file so THIS fresh verification alone correctly reports
+        // "not installed" for the brief window until the repair completes -
+        // no persisted flag needed.
+        bool needsUpdate = recordedInstalled && !string.IsNullOrWhiteSpace(moddedPath) && !filesVerifiedPresent;
 
         // Revamp Core's checkbox is locked (never user-toggleable), so it's
         // purely informational - it must answer "is Revamp genuinely
