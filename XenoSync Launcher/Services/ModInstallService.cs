@@ -26,8 +26,11 @@ namespace XenoSyncLauncher.Services;
 ///     pack, merged into "data/chara/CHI").
 ///   - .x2m file(s) present  -> installed via XV2INS (requires XV2Patcher
 ///     already installed - XV2INS relies on files it sets up).
-///   - .exe file(s), no .x2m -> run as a self-installer.
-///   - neither                -> "loose files" mod: every extracted file is
+///   - .x2s file(s), no .x2m -> copied directly into "data/", flat (e.g.
+///     Revamp Organized Slots) - not routed through XV2INS at all; Revamp
+///     reads .x2s files straight out of data/ itself.
+///   - .exe file(s), no .x2m/.x2s -> run as a self-installer.
+///   - none of the above     -> "loose files" mod: every extracted file is
 ///     just copied directly into the Modded folder (the old behavior, still
 ///     correct for mods that ship as plain drop-in files).
 ///
@@ -65,12 +68,12 @@ public class ModInstallService
     /// <summary>Downloads+extracts the mod if needed (all parts, for multi-volume archives), then copies its files into moddedPath.</summary>
     public async Task<(bool Success, string? ErrorMessage)> EnableAsync(
         ModRecord mod, string moddedPath, IProgress<DownloadProgressInfo>? downloadProgress, double? speedLimitMbps,
-        Action<string>? onStatus, CancellationToken cancellationToken)
+        Action<string>? onStatus, CancellationToken cancellationToken, bool isRepair = false)
     {
         var (extracted, extractError) = await EnsureExtractedAsync(mod, moddedPath, downloadProgress, speedLimitMbps, onStatus, cancellationToken);
         if (!extracted) return (false, extractError);
 
-        return await InstallExtractedModAsync(mod, mod.RepositoryFolder!, moddedPath, onStatus, cancellationToken);
+        return await InstallExtractedModAsync(mod, mod.RepositoryFolder!, moddedPath, onStatus, cancellationToken, isRepair);
     }
 
     /// <summary>The download+extract half of EnableAsync, split out so InstallBatchAsync can extract every pending mod first and only then decide how to install them (grouping the .x2m ones together).</summary>
@@ -145,9 +148,9 @@ public class ModInstallService
     /// whose install method turns out to be X2M into a single shared XV2INS
     /// invocation (all their .x2m files passed as one combined argument
     /// list) instead of one XV2INS confirmation per mod. Loose-files,
-    /// merge-into-subfolder, and .exe-installer mods are still installed one
-    /// at a time since batching only helps with XV2INS's own per-launch
-    /// confirmation dialog.
+    /// merge-into-subfolder, .x2s, and .exe-installer mods are still
+    /// installed one at a time since batching only helps with XV2INS's own
+    /// per-launch confirmation dialog.
     ///
     /// Trade-off: XV2INS doesn't tell us which resulting file came from
     /// which .x2m, so a single before/after snapshot around the whole batch
@@ -158,9 +161,16 @@ public class ModInstallService
     /// separately (one at a time) instead of via this batch path if you need
     /// precise per-mod Uninstall.
     /// </summary>
+    /// <param name="isRepair">
+    /// True when this batch is running as part of a Repair (see
+    /// MainWindow.MarkAllEnabledModsForReinstall/StartUpdate), rather than a
+    /// first-time install - passed through to InstallX2mGroupAsync, which
+    /// only runs companion .exe(s) such as Lazybones' "Revamp Dynamic Hair
+    /// Repairer" when this is true. See InstallX2mGroupAsync's remarks for why.
+    /// </param>
     public async Task<Dictionary<string, (bool Success, string? ErrorMessage)>> InstallBatchAsync(
         List<ModRecord> mods, string moddedPath, IProgress<DownloadProgressInfo>? downloadProgress, double? speedLimitMbps,
-        Action<string>? onStatus, CancellationToken cancellationToken)
+        Action<string>? onStatus, CancellationToken cancellationToken, bool isRepair = false)
     {
         var results = new Dictionary<string, (bool, string?)>();
         var x2mGroup = new List<(ModRecord Mod, List<string> X2mFiles, string ExtractedFolder)>();
@@ -184,10 +194,10 @@ public class ModInstallService
 
                 // Catalog-declared "merge this into an existing subfolder"
                 // mods (e.g. Chi-Chi's DYT pack, merged into
-                // data/chara/CHI) bypass the x2m/exe/loose-files detection
-                // entirely - the catalog already says exactly how they need
-                // to be installed, so there's nothing to infer from what's
-                // inside the extracted folder.
+                // data/chara/CHI) bypass the x2m/x2s/exe/loose-files
+                // detection entirely - the catalog already says exactly how
+                // they need to be installed, so there's nothing to infer
+                // from what's inside the extracted folder.
                 if (!string.IsNullOrWhiteSpace(mod.MergeTargetSubfolder))
                 {
                     onStatus?.Invoke($"Merging {mod.Title} into '{mod.MergeTargetSubfolder}'...");
@@ -203,6 +213,10 @@ public class ModInstallService
                 {
                     case ModInstallMethod.X2M:
                         x2mGroup.Add((mod, installerFiles, mod.RepositoryFolder!));
+                        break;
+                    case ModInstallMethod.X2S:
+                        onStatus?.Invoke($"Installing {mod.Title} into 'data/'...");
+                        results[mod.Id] = InstallX2sFiles(mod, installerFiles, moddedPath);
                         break;
                     case ModInstallMethod.Executable:
                         results[mod.Id] = await InstallViaExecutableAsync(mod, installerFiles, moddedPath, onStatus, cancellationToken);
@@ -225,7 +239,7 @@ public class ModInstallService
         {
             try
             {
-                var batchResults = await InstallX2mGroupAsync(x2mGroup, moddedPath, onStatus, cancellationToken);
+                var batchResults = await InstallX2mGroupAsync(x2mGroup, moddedPath, onStatus, cancellationToken, isRepair);
                 foreach (var (id, result) in batchResults)
                     results[id] = result;
             }
@@ -240,9 +254,20 @@ public class ModInstallService
         return results;
     }
 
-    /// <summary>The actual shared-XV2INS-call logic used by InstallBatchAsync for every mod whose install method is X2M.</summary>
+    /// <summary>
+    /// The actual shared-XV2INS-call logic used by InstallBatchAsync for
+    /// every mod whose install method is X2M.
+    /// </summary>
+    /// <param name="isRepair">
+    /// Gates whether each mod's companion .exe (e.g. Lazybones' "Revamp
+    /// Dynamic Hair Repairer LBNT Colors.exe") runs after the shared XV2INS
+    /// pass. That repairer is meant to fix up dynamic-hair state that only
+    /// needs correcting on a Repair/reinstall pass - running it on a
+    /// genuinely first-time install has nothing to "repair" yet and isn't
+    /// wanted there, so it's skipped entirely unless isRepair is true.
+    /// </param>
     private async Task<Dictionary<string, (bool Success, string? ErrorMessage)>> InstallX2mGroupAsync(
-        List<(ModRecord Mod, List<string> X2mFiles, string ExtractedFolder)> group, string moddedPath, Action<string>? onStatus, CancellationToken token)
+        List<(ModRecord Mod, List<string> X2mFiles, string ExtractedFolder)> group, string moddedPath, Action<string>? onStatus, CancellationToken token, bool isRepair)
     {
         var results = new Dictionary<string, (bool, string?)>();
 
@@ -284,14 +309,20 @@ public class ModInstallService
             await process.WaitForExitAsync(token);
         }
 
-        // Companion .exe(s) (e.g. Lazybones' hair repairer) are per-mod, run after the shared XV2INS pass.
-        foreach (var (mod, _, extractedFolder) in group)
+        // Companion .exe(s) (e.g. Lazybones' hair repairer) are per-mod, run
+        // after the shared XV2INS pass - but only during a Repair (see this
+        // method's <param> remarks above). A first-time install has nothing
+        // for a "repairer" to fix yet.
+        if (isRepair)
         {
-            foreach (var exe in Directory.GetFiles(extractedFolder, "*.exe", SearchOption.TopDirectoryOnly))
+            foreach (var (mod, _, extractedFolder) in group)
             {
-                onStatus?.Invoke($"Running {Path.GetFileName(exe)} for {mod.Title}...");
-                using var exeProcess = Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true, WorkingDirectory = extractedFolder });
-                if (exeProcess is not null) await exeProcess.WaitForExitAsync(token);
+                foreach (var exe in Directory.GetFiles(extractedFolder, "*.exe", SearchOption.TopDirectoryOnly))
+                {
+                    onStatus?.Invoke($"Running {Path.GetFileName(exe)} for {mod.Title}...");
+                    using var exeProcess = Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true, WorkingDirectory = extractedFolder });
+                    if (exeProcess is not null) await exeProcess.WaitForExitAsync(token);
+                }
             }
         }
 
@@ -318,15 +349,16 @@ public class ModInstallService
 
     /// <summary>
     /// Which install method a mod's extracted files call for. LooseFiles/
-    /// Executable/X2M are detected by what's actually inside the extracted
-    /// folder (see DetectInstallMethod) - MergeIntoSubfolder is never
-    /// returned by that detection; it's decided directly from the catalog's
-    /// ModRecord.MergeTargetSubfolder before DetectInstallMethod is even
-    /// called (see InstallExtractedModAsync/InstallBatchAsync), since there's
-    /// nothing about the extracted content itself that reliably signals
-    /// "merge me into an existing subfolder" the way an .x2m or .exe does.
+    /// Executable/X2M/X2S are detected by what's actually inside the
+    /// extracted folder (see DetectInstallMethod) - MergeIntoSubfolder is
+    /// never returned by that detection; it's decided directly from the
+    /// catalog's ModRecord.MergeTargetSubfolder before DetectInstallMethod is
+    /// even called (see InstallExtractedModAsync/InstallBatchAsync), since
+    /// there's nothing about the extracted content itself that reliably
+    /// signals "merge me into an existing subfolder" the way an .x2m, .x2s,
+    /// or .exe does.
     /// </summary>
-    public enum ModInstallMethod { LooseFiles, Executable, X2M, MergeIntoSubfolder }
+    public enum ModInstallMethod { LooseFiles, Executable, X2M, X2S, MergeIntoSubfolder }
 
     /// <summary>Looks at what's inside an already-extracted mod folder to decide how it needs to be installed.</summary>
     public static ModInstallMethod DetectInstallMethod(string extractedFolder, out List<string> installerFiles)
@@ -336,6 +368,15 @@ public class ModInstallService
         {
             installerFiles = x2mFiles;
             return ModInstallMethod.X2M;
+        }
+
+        // .x2s files (e.g. Revamp Organized Slots) don't go through XV2INS at
+        // all - they're copied straight into "data/" (see InstallX2sFiles).
+        var x2sFiles = Directory.GetFiles(extractedFolder, "*.x2s", SearchOption.AllDirectories).ToList();
+        if (x2sFiles.Count > 0)
+        {
+            installerFiles = x2sFiles;
+            return ModInstallMethod.X2S;
         }
 
         var exeFiles = Directory.GetFiles(extractedFolder, "*.exe", SearchOption.AllDirectories).ToList();
@@ -357,7 +398,7 @@ public class ModInstallService
     /// no re-download/re-extract needed).
     /// </summary>
     public async Task<(bool Success, string? ErrorMessage)> InstallExtractedModAsync(
-        ModRecord mod, string extractedFolder, string moddedPath, Action<string>? onStatus, CancellationToken cancellationToken)
+        ModRecord mod, string extractedFolder, string moddedPath, Action<string>? onStatus, CancellationToken cancellationToken, bool isRepair = false)
     {
         // Night Conton City's archive has an "Install First"/"Install Second"
         // structure - see InstallNightContonCityAsync for the two-step,
@@ -367,7 +408,7 @@ public class ModInstallService
 
         // Catalog-declared "merge this into an existing subfolder" mods
         // (e.g. Chi-Chi's DYT pack, merged into data/chara/CHI) bypass the
-        // x2m/exe/loose-files detection entirely - see ModInstallMethod's
+        // x2m/x2s/exe/loose-files detection entirely - see ModInstallMethod's
         // remarks on why this can't be inferred from the extracted content.
         if (!string.IsNullOrWhiteSpace(mod.MergeTargetSubfolder))
         {
@@ -390,7 +431,8 @@ public class ModInstallService
 
         return method switch
         {
-            ModInstallMethod.X2M => await InstallViaX2mAsync(mod, installerFiles, extractedFolder, moddedPath, onStatus, cancellationToken),
+            ModInstallMethod.X2M => await InstallViaX2mAsync(mod, installerFiles, extractedFolder, moddedPath, onStatus, cancellationToken, isRepair),
+            ModInstallMethod.X2S => InstallX2sFiles(mod, installerFiles, moddedPath),
             ModInstallMethod.Executable => await InstallViaExecutableAsync(mod, installerFiles, moddedPath, onStatus, cancellationToken),
             _ => InstallLooseFiles(mod, extractedFolder, moddedPath)
         };
@@ -563,7 +605,19 @@ public class ModInstallService
         return rank;
     }
 
-    /// <summary>The original behavior: every extracted file is just copied as-is into the Modded folder. Correct for mods that ship as plain drop-in files, no installer.</summary>
+    /// <summary>
+    /// The original behavior: every extracted file is just copied as-is into
+    /// the Modded folder. Correct for mods that ship as plain drop-in files,
+    /// no installer. Fails explicitly (rather than reporting a false
+    /// success) if the extracted folder turned out to have nothing to copy -
+    /// an empty/corrupt archive or an unexpected layout would otherwise
+    /// silently "succeed" with zero files actually installed, which for a
+    /// XenoSyncCore (mandatory) mod is worse than a visible failure: since
+    /// InstalledRelativeFiles stays empty, the next mod-catalog reload
+    /// re-treats it as "never installed" rather than "broken", resetting
+    /// NeedsUpdate back to false and letting Run report everything as
+    /// up to date even though nothing was actually placed on disk.
+    /// </summary>
     private (bool Success, string? ErrorMessage) InstallLooseFiles(ModRecord mod, string extractedFolder, string moddedPath)
     {
         var written = new List<string>();
@@ -577,6 +631,37 @@ public class ModInstallService
             written.Add(relative);
         }
 
+        if (written.Count == 0)
+            return (false, $"{mod.Title}'s extracted folder had no files to copy - its archive may be empty, or its layout may have changed.");
+
+        mod.InstalledRelativeFiles = written;
+        mod.IsEnabled = true;
+        return (true, null);
+    }
+
+    /// <summary>
+    /// Installs .x2s file(s) (e.g. Revamp Organized Slots) by copying them
+    /// directly into "&lt;ModdedPath&gt;/data/", flat - not preserving
+    /// whatever subfolder structure the source archive used, and not routed
+    /// through XV2INS/.x2m tooling at all: Revamp reads .x2s files straight
+    /// out of data/ itself.
+    /// </summary>
+    private static (bool Success, string? ErrorMessage) InstallX2sFiles(ModRecord mod, List<string> x2sFiles, string moddedPath)
+    {
+        var dataDir = Path.Combine(moddedPath, "data");
+        Directory.CreateDirectory(dataDir);
+
+        var written = new List<string>();
+        foreach (var file in x2sFiles)
+        {
+            var destination = Path.Combine(dataDir, Path.GetFileName(file));
+            System.IO.File.Copy(file, destination, overwrite: true);
+            written.Add(Path.GetRelativePath(moddedPath, destination));
+        }
+
+        if (written.Count == 0)
+            return (false, $"{mod.Title}'s extracted archive had no .x2s files to install.");
+
         mod.InstalledRelativeFiles = written;
         mod.IsEnabled = true;
         return (true, null);
@@ -586,12 +671,12 @@ public class ModInstallService
     /// Installs a mod by merging its extracted content into an existing
     /// subfolder of the Modded folder (mod.MergeTargetSubfolder), instead of
     /// dropping the raw extracted files at the Modded root or trying to
-    /// infer an x2m/exe/loose-files method from what's inside. Used for mods
-    /// whose real, manual install instructions amount to "drag this folder's
-    /// contents into the matching folder that's already there" - e.g.
-    /// InviernoCreations' Chi-Chi DYT pack, whose "CHI" folder needs to be
-    /// merged into the already-installed "data/chara/CHI", not extracted as
-    /// a sibling "CHI" folder next to the game's own bin/data.
+    /// infer an x2m/x2s/exe/loose-files method from what's inside. Used for
+    /// mods whose real, manual install instructions amount to "drag this
+    /// folder's contents into the matching folder that's already there" -
+    /// e.g. InviernoCreations' Chi-Chi DYT pack, whose "CHI" folder needs to
+    /// be merged into the already-installed "data/chara/CHI", not extracted
+    /// as a sibling "CHI" folder next to the game's own bin/data.
     ///
     /// If the extracted archive wraps everything in a single top-level
     /// folder (a common "the whole mod lives inside one folder" archive
@@ -683,14 +768,16 @@ public class ModInstallService
     /// checkbox toggle or the Reinstall button). InstallBatchAsync has its
     /// own equivalent (InstallX2mGroupAsync) that batches *across* mods too.
     ///
-    /// Afterward, runs any companion .exe sitting at the archive's top level
-    /// (not nested in a data/support subfolder) - some mods (Lazybones'
-    /// "Revamp Dynamic Hair Repairer") ship a finishing step that needs to
-    /// run once the .x2m content is actually in place, rather than being an
-    /// installer for separate content of its own.
+    /// Afterward, if isRepair is true, runs any companion .exe sitting at
+    /// the archive's top level (not nested in a data/support subfolder) -
+    /// some mods (Lazybones' "Revamp Dynamic Hair Repairer") ship a
+    /// finishing step that needs to run once the .x2m content is actually in
+    /// place, but only makes sense as a *repair* pass over existing content
+    /// - a first-time install has nothing yet for it to fix, so it's skipped
+    /// unless isRepair is true.
     /// </summary>
     private async Task<(bool Success, string? ErrorMessage)> InstallViaX2mAsync(
-        ModRecord mod, List<string> x2mFiles, string extractedFolder, string moddedPath, Action<string>? onStatus, CancellationToken token)
+        ModRecord mod, List<string> x2mFiles, string extractedFolder, string moddedPath, Action<string>? onStatus, CancellationToken token, bool isRepair)
     {
         var xv2insPath = Path.Combine(moddedPath, "XV2INS.exe");
         if (!System.IO.File.Exists(xv2insPath))
@@ -717,11 +804,14 @@ public class ModInstallService
         if (process is null) return (false, $"Couldn't start XV2INS for {mod.Title}.");
         await process.WaitForExitAsync(token);
 
-        foreach (var exe in Directory.GetFiles(extractedFolder, "*.exe", SearchOption.TopDirectoryOnly))
+        if (isRepair)
         {
-            onStatus?.Invoke($"Running {Path.GetFileName(exe)}...");
-            using var exeProcess = Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true, WorkingDirectory = extractedFolder });
-            if (exeProcess is not null) await exeProcess.WaitForExitAsync(token);
+            foreach (var exe in Directory.GetFiles(extractedFolder, "*.exe", SearchOption.TopDirectoryOnly))
+            {
+                onStatus?.Invoke($"Running {Path.GetFileName(exe)}...");
+                using var exeProcess = Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true, WorkingDirectory = extractedFolder });
+                if (exeProcess is not null) await exeProcess.WaitForExitAsync(token);
+            }
         }
 
         var newFiles = await SnapshotDiffWithRetryAsync(moddedPath, before);
@@ -854,7 +944,7 @@ public class ModInstallService
         return partFiles.OrderBy(f => f, StringComparer.OrdinalIgnoreCase).First();
     }
 
-    /// <summary>Deletes exactly the files this mod is recorded as having written, then clears that record. Works the same regardless of which install method wrote them (loose files, .exe, .x2m, or merge-into-subfolder), since all of them end up recorded the same way.</summary>
+    /// <summary>Deletes exactly the files this mod is recorded as having written, then clears that record. Works the same regardless of which install method wrote them (loose files, .exe, .x2m, .x2s, or merge-into-subfolder), since all of them end up recorded the same way.</summary>
     public void Disable(ModRecord mod, string moddedPath)
     {
         foreach (var relative in mod.InstalledRelativeFiles)
@@ -875,7 +965,11 @@ public class ModInstallService
     /// this mod, then re-runs installation from its already-extracted folder
     /// (no re-download/re-extract, unless that folder is missing - e.g. the
     /// user deleted XenoSync/DownloadedMods/{id} manually - in which case
-    /// this reports that instead of silently doing nothing).
+    /// this reports that instead of silently doing nothing). Always passes
+    /// isRepair: true to InstallExtractedModAsync - "Reinstall" of an
+    /// already-installed mod is, by definition, a repair pass rather than a
+    /// first-time install, so any repair-only companion step (e.g.
+    /// Lazybones' hair repairer) is meant to run here.
     /// </summary>
     public async Task<(bool Success, string? ErrorMessage)> ReinstallAsync(
         ModRecord mod, string moddedPath, Action<string>? onStatus, CancellationToken cancellationToken)
@@ -884,6 +978,6 @@ public class ModInstallService
             return (false, $"{mod.Title}'s extracted files aren't on disk anymore - re-download it instead of reinstalling.");
 
         Disable(mod, moddedPath);
-        return await InstallExtractedModAsync(mod, mod.RepositoryFolder, moddedPath, onStatus, cancellationToken);
+        return await InstallExtractedModAsync(mod, mod.RepositoryFolder, moddedPath, onStatus, cancellationToken, isRepair: true);
     }
 }
