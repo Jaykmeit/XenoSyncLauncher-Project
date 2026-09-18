@@ -99,6 +99,17 @@ public partial class MainWindow : Window
     private int _currentTaskIndex;
 
     /// <summary>
+    /// True for the duration of an Update triggered by a forced Repair (set
+    /// in StartUpdate from the same ForceReinstallOnNextUpdate flag it
+    /// captures as wasForceReinstall). Passed through to
+    /// ModInstallService.InstallBatchAsync via EnsureMandatoryModsInstalledAsync
+    /// so repair-only steps (e.g. Lazybones' "Revamp Dynamic Hair Repairer",
+    /// which only makes sense to run over already-installed content) know to
+    /// actually run, instead of firing on every first-time install too.
+    /// </summary>
+    private bool _isRepairInProgress;
+
+    /// <summary>
     /// Cancelling this is how "Pause" (and closing the app mid-update) works:
     /// for the real DepotDownloader task it kills the process (which has its
     /// own resume mechanism), for simulated tasks it just breaks the delay loop.
@@ -714,7 +725,7 @@ public partial class MainWindow : Window
             : $"Installing {pending.Count} mods (grouping any .x2m ones into a single XV2INS pass where possible)...");
 
         var results = await _modInstallService.InstallBatchAsync(
-            pending, _settings.ModdedPath, downloadProgress: null, _settings.SpeedLimitMbps, msg => AppendLog(msg), CancellationToken.None);
+            pending, _settings.ModdedPath, downloadProgress: null, _settings.SpeedLimitMbps, msg => AppendLog(msg), CancellationToken.None, _isRepairInProgress);
 
         foreach (var record in pending)
         {
@@ -1303,8 +1314,9 @@ public partial class MainWindow : Window
     /// EnsureMandatoryModsInstalledAsync entirely (see that method) and is
     /// instead reinstalled via LauncherSettings.ForceReinstallOnNextUpdate
     /// (consumed by UpdateTaskPlanner), which the Repair button also sets.
-    /// Its own stale "installed" marker is separately cleared by
-    /// ResetRevampInstallMarker right before its Update tasks run.
+    /// Its own stale "installed" marker (along with every other mod's
+    /// leftovers under data/) is separately cleared by
+    /// ClearDataFolderExceptUi right before Update's tasks run.
     /// </summary>
     private void MarkAllEnabledModsForReinstall()
     {
@@ -1323,44 +1335,54 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Deletes Revamp's own "installed" marker - the "data/LB Mod Installer"
-    /// folder IsRevampInstalledCorrectly checks for - right before a forced
-    /// Repair re-runs Revamp's installer. Revamp Core has no tracked file
-    /// list the way other mods do (see MarkAllEnabledModsForReinstall, which
-    /// deliberately skips it), so its stale marker from the PREVIOUS install
-    /// is never otherwise cleared.
+    /// Deletes everything directly under "&lt;ModdedPath&gt;/data/" except the
+    /// "ui" subfolder, right before a forced Repair re-runs XV2Patcher/
+    /// XV2INS/Revamp's install tasks. Confirmed (by the maintainer) that
+    /// "ui" is the only folder present in a genuinely vanilla install's
+    /// data/ - everything else in there (chara, stage, skill, .x2s slot
+    /// files, etc.) is mod/patch content, so it needs to be gone before a
+    /// repair reinstalls it or stale files from a since-removed or
+    /// since-changed mod can linger indefinitely and conflict with (or
+    /// simply outlive) whatever the repair puts back.
     ///
-    /// Left in place, that stale marker makes RunInstallTaskAsync's post-copy
-    /// verification (IsRevampInstalledCorrectly) trivially pass even if this
-    /// repair's own installer run never actually found/launched the LB
-    /// Installer .exe at all (e.g. it wasn't at the top level of the freshly
-    /// extracted archive) - the deep, AllDirectories fallback search for a
-    /// nested installer only runs when that verification fails, so a stale
-    /// marker silently skips that fallback too. This is the most likely
-    /// explanation for "Repair says it succeeded but Revamp's installer
-    /// never actually popped up": the repair quietly did nothing for Revamp
-    /// while the rest of the pipeline (mods, XV2Patcher) worked correctly.
-    ///
-    /// Deliberately does NOT touch anything else under the Modded folder -
-    /// Revamp's actual game-content files aren't tracked anywhere the way
-    /// other mods' InstalledRelativeFiles are, and for an OverVanilla install
-    /// the Modded folder IS the Vanilla Steam folder, so a broader cleanup
-    /// here risks deleting files that don't belong to Revamp at all.
+    /// This also covers Revamp's own "installed" marker (the
+    /// "data/LB Mod Installer" folder IsRevampInstalledCorrectly checks
+    /// for) - superseding the narrower fix that used to delete just that one
+    /// folder - so RunInstallTaskAsync's post-copy verification for Revamp
+    /// is guaranteed to start from "not installed" rather than trusting a
+    /// stale marker left over from the previous install, and every mod's
+    /// on-disk content (not just what InstalledRelativeFiles happened to
+    /// track) is genuinely gone before the repair puts fresh copies back.
     /// </summary>
-    private void ResetRevampInstallMarker(string moddedPath)
+    private void ClearDataFolderExceptUi(string moddedPath)
     {
+        var dataDir = Path.Combine(moddedPath, "data");
+        if (!Directory.Exists(dataDir)) return;
+
         try
         {
-            var lbInstallerDir = Path.Combine(moddedPath, "data", "LB Mod Installer");
-            if (Directory.Exists(lbInstallerDir))
+            int deletedFiles = 0, deletedDirs = 0;
+
+            foreach (var file in Directory.GetFiles(dataDir, "*", SearchOption.TopDirectoryOnly))
             {
-                Directory.Delete(lbInstallerDir, recursive: true);
-                AppendLog("Repair: cleared Revamp's previous install marker so it gets genuinely reinstalled and verified.");
+                try { File.Delete(file); deletedFiles++; }
+                catch (Exception ex) { AppendLog($"Repair: couldn't delete '{file}': {ex.Message}", LogLevel.Warning); }
             }
+
+            foreach (var dir in Directory.GetDirectories(dataDir, "*", SearchOption.TopDirectoryOnly))
+            {
+                if (string.Equals(Path.GetFileName(dir), "ui", StringComparison.OrdinalIgnoreCase))
+                    continue; // preserved on purpose - see this method's remarks
+
+                try { Directory.Delete(dir, recursive: true); deletedDirs++; }
+                catch (Exception ex) { AppendLog($"Repair: couldn't delete '{dir}': {ex.Message}", LogLevel.Warning); }
+            }
+
+            AppendLog($"Repair: cleared '{dataDir}' (kept 'ui') - removed {deletedDirs} folder(s) and {deletedFiles} loose file(s) so everything reinstalls onto a clean slate.");
         }
         catch (Exception ex)
         {
-            AppendLog($"Repair: couldn't clear Revamp's previous install marker: {ex.Message}", LogLevel.Warning);
+            AppendLog($"Repair: couldn't clear the data folder: {ex.Message}", LogLevel.Warning);
         }
     }
 
@@ -1379,6 +1401,7 @@ public partial class MainWindow : Window
         _updateTasks = _updateTaskPlanner.BuildPlan(_lastComparison, _settings);
 
         bool wasForceReinstall = _settings?.ForceReinstallOnNextUpdate == true;
+        _isRepairInProgress = wasForceReinstall;
 
         if (_settings is { ForceReinstallOnNextUpdate: true })
         {
@@ -1386,13 +1409,16 @@ public partial class MainWindow : Window
             _settingsService.Save(_settings);
         }
 
-        // See ResetRevampInstallMarker's own remarks for the full reasoning:
-        // a forced Repair re-runs Revamp's installer, but nothing else
-        // clears the file that marks it "installed" from the PREVIOUS run,
-        // which can make the repair silently no-op for Revamp specifically
-        // while everything else (XV2Patcher, mods) reinstalls correctly.
+        // See ClearDataFolderExceptUi's own remarks for the full reasoning:
+        // a forced Repair re-runs XV2Patcher/XV2INS/Revamp's install tasks
+        // (and, via _isRepairInProgress above, marks every enabled mod for
+        // reinstall too), but nothing else wipes the old content those
+        // reinstalls would otherwise just merge on top of - including the
+        // file that marks Revamp "installed" from the PREVIOUS run, which
+        // can make a repair silently no-op for Revamp specifically while
+        // everything else still reinstalls correctly.
         if (wasForceReinstall && _settings?.ModdedPath is not null)
-            ResetRevampInstallMarker(_settings.ModdedPath);
+            ClearDataFolderExceptUi(_settings.ModdedPath);
 
         if (_updateTasks.Count == 0)
         {
@@ -2383,6 +2409,42 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// Kills any running process matching processName (case-insensitive,
+    /// no ".exe" suffix), waiting briefly for it to fully exit. Used right
+    /// before overwriting an executable that might still be locked by a
+    /// previous run - most concretely XV2INS.exe/xv2characreat.exe, which
+    /// RunXv2InsFirstLaunchAsync and ModInstallService's X2M install paths
+    /// deliberately launch and wait on, but which can end up still holding
+    /// their own file handle open (or which the user may still have open
+    /// manually) by the time a Repair tries to overwrite them with a fresh
+    /// copy - producing a "being used by another process" IOException from
+    /// File.Copy. Best-effort: a process that can't be killed (already
+    /// exited, access denied) is silently skipped rather than failing the
+    /// whole install.
+    /// </summary>
+    private static void KillProcessIfRunning(string processName)
+    {
+        foreach (var process in Process.GetProcessesByName(processName))
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit(5000);
+            }
+            catch
+            {
+                // Already exited between GetProcessesByName and Kill, access
+                // denied, etc. - best effort, the retry loop in
+                // CopyFileWithRetry is the real safety net either way.
+            }
+            finally
+            {
+                process.Dispose();
+            }
+        }
+    }
+
     private async Task<bool> RunInstallTaskAsync(string componentKey, CancellationToken token)
     {
         if (string.IsNullOrWhiteSpace(_settings?.ModdedPath))
@@ -2481,6 +2543,19 @@ public partial class MainWindow : Window
                                   "merging its extracted files directly instead. If Revamp still isn't showing as " +
                                   "installed afterwards, its archive layout may have changed.", LogLevel.Warning);
                     }
+                }
+
+                if (componentKey == "xv2ins")
+                {
+                    // A previous XV2INS run (RunXv2InsFirstLaunchAsync from an
+                    // earlier Update, XV2INS launched to install a .x2m mod,
+                    // or the user simply having it open) may still be holding
+                    // xv2ins.exe/xv2characreat.exe open when a Repair tries to
+                    // overwrite them here - producing a "being used by
+                    // another process" IOException. Kill any running copy
+                    // first so the overwrite below can actually succeed.
+                    KillProcessIfRunning("xv2ins");
+                    KillProcessIfRunning("xv2characreat");
                 }
 
                 // xv2ins-dcd's files specifically belong under data/ (that's
@@ -2647,7 +2722,33 @@ public partial class MainWindow : Window
             var relative = Path.GetRelativePath(sourceDir, file);
             var destination = Path.Combine(targetDir, relative);
             Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-            File.Copy(file, destination, overwrite: true);
+            CopyFileWithRetry(file, destination);
+        }
+    }
+
+    /// <summary>
+    /// File.Copy with a short retry loop for transient "being used by another
+    /// process" IOExceptions - e.g. overwriting xv2ins.exe during a Repair
+    /// when a previous XV2INS run hasn't fully released its file handle yet
+    /// even after KillProcessIfRunning, or antivirus is still scanning a
+    /// just-extracted file. Mirrors the same retry pattern LaunchAndWaitAsync
+    /// already uses for the analogous "file locked right after extraction"
+    /// case, just synchronous since MergeDirectory already runs on a
+    /// background thread via Task.Run.
+    /// </summary>
+    private static void CopyFileWithRetry(string sourcePath, string destinationPath, int maxAttempts = 5)
+    {
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                File.Copy(sourcePath, destinationPath, overwrite: true);
+                return;
+            }
+            catch (IOException) when (attempt < maxAttempts)
+            {
+                Thread.Sleep(500 * attempt);
+            }
         }
     }
 
