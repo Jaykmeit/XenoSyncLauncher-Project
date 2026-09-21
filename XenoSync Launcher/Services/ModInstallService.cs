@@ -637,9 +637,23 @@ public class ModInstallService
     /// third, Vanilla-only "2. [Vanilla Only] Parallel Quests and Expert
     /// Missions" folder whose own readme warns it can crash the game under
     /// Revamp. Only the Revamp-labelled .x2m set is installed; both Vanilla
-    /// folders are skipped entirely. ("Revamp" only appears in the one
-    /// folder name meant to be kept, so a simple substring match is enough -
-    /// no need to separately exclude the other two by name.)
+    /// folders are skipped entirely.
+    ///
+    /// The "Revamp" check is deliberately done against the path RELATIVE to
+    /// extractedFolder, not the file's full absolute path - the Modded
+    /// folder itself is very commonly named something like
+    /// "DB Xenoverse 2 REVAMP", so a plain Contains("Revamp") against the
+    /// absolute path matched every single .x2m in the archive (Vanilla
+    /// folders included), which is exactly what produced duplicate/
+    /// conflicting character installs.
+    ///
+    /// Also excludes Sparking Pack's own "Vegeta (Ultra Ego).x2m" - a
+    /// better version of that character already exists elsewhere in the
+    /// catalog (kept there since Parallel Quests likely depends on it), and
+    /// this specific copy has a known "Ultimate Charge" bug (a static pose
+    /// while charging Ki). The exclusion only matches that exact character
+    /// swap, not "Vegeta Wig (Ultra Ego).x2m" (a cosmetic accessory) or the
+    /// "Ultra Ego for CaC/CAC" Create-a-Character presets, which are kept.
     ///
     /// The archive's separate "3. Installer (Presets for UI-Sign and UI)"
     /// folder holds a companion .exe (UI presets) that isn't a .x2m at all -
@@ -648,7 +662,8 @@ public class ModInstallService
     /// </summary>
     private static List<string> SelectSparkingPackX2mFiles(string extractedFolder) =>
         Directory.GetFiles(extractedFolder, "*.x2m", SearchOption.AllDirectories)
-            .Where(f => f.Contains("Revamp", StringComparison.OrdinalIgnoreCase))
+            .Where(f => Path.GetRelativePath(extractedFolder, f).Contains("Revamp", StringComparison.OrdinalIgnoreCase))
+            .Where(f => !Path.GetFileName(f).Contains("Vegeta (Ultra Ego)", StringComparison.OrdinalIgnoreCase))
             .ToList();
 
     /// <summary>
