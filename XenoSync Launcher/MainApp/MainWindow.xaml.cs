@@ -43,6 +43,7 @@ public partial class MainWindow : Window
     private readonly ArchiveExtractionService _archiveExtractionService = new();
     private readonly InstalledComponentVersionService _installedVersionService = new();
     private readonly ComponentDownloadService _componentDownloadService = new();
+    private readonly DirectorySwapService _directorySwapService = new();
 
     /// <summary>Where each component's downloaded file ended up, keyed by "xv2patcher"/"revamp". Reset each time Update starts.</summary>
     private readonly Dictionary<string, string> _componentDownloadedFiles = new();
@@ -2357,6 +2358,19 @@ public partial class MainWindow : Window
     /// RunExtractOrLaunchTaskAsync), this waits for the person to close
     /// XV2INS's own window themselves - there's no known silent/no-UI flag
     /// to rely on instead, and guessing at one risks silently doing nothing.
+    ///
+    /// XV2INS itself doesn't look at the folder it's running from to find
+    /// Xenoverse 2 - it looks the install up on its own (via Steam), which
+    /// for a separate-directory install always resolves to the Vanilla
+    /// folder rather than the Modded one XV2INS.exe was actually placed in.
+    /// Since Vanilla isn't the downgraded build XV2INS expects, its
+    /// first-run initialization otherwise fails against it outright. For a
+    /// separate-directory install this briefly swaps the Modded folder into
+    /// the Vanilla folder's location for just this one run (via
+    /// DirectorySwapService), so XV2INS initializes against the right
+    /// content, then always swaps everything back - whether the run
+    /// succeeds, fails, or is cancelled. An Over-Vanilla install already has
+    /// VanillaPath == ModdedPath, so nothing needs swapping there.
     /// </summary>
     private async Task<bool> RunXv2InsFirstLaunchAsync(CancellationToken token)
     {
@@ -2366,22 +2380,49 @@ public partial class MainWindow : Window
             return false;
         }
 
-        var xv2insPath = Path.Combine(_settings.ModdedPath, "XV2INS.exe");
-        if (!File.Exists(xv2insPath))
+        bool isSeparateDirectoryInstall = !string.IsNullOrWhiteSpace(_settings.VanillaPath) &&
+            !string.Equals(_settings.VanillaPath, _settings.ModdedPath, StringComparison.OrdinalIgnoreCase);
+
+        DirectorySwapState? swapState = null;
+
+        if (isSeparateDirectoryInstall)
         {
-            AppendLog($"Cannot run XV2INS: '{xv2insPath}' wasn't found - the previous install step may not have completed.", LogLevel.Error);
-            return false;
+            try
+            {
+                swapState = _directorySwapService.Swap(_settings.VanillaPath!, _settings.ModdedPath);
+                if (swapState is not null)
+                    AppendLog("Temporarily swapping the Modded folder into the Vanilla folder's location " +
+                              "(Vanilla parked as 'temporary_Xenoverse2') so XV2INS initializes against the right content...");
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"Couldn't prepare the temporary Vanilla/Modded folder swap for XV2INS: {ex.Message}", LogLevel.Error);
+                return false;
+            }
         }
 
-        AppendLog("Launching XV2INS for the first time so it can initialize itself against this Modded folder - " +
-                  "please close it once it's done, and XenoSync Launcher will continue automatically.");
+        // While swapped, the Modded folder's actual content (XV2INS.exe
+        // included) is physically sitting at what used to be the Vanilla
+        // path - that's where XV2INS must be launched from/against so it
+        // finds itself in the location Steam reports.
+        var runDirectory = swapState is not null ? _settings.VanillaPath! : _settings.ModdedPath;
+        var xv2insPath = Path.Combine(runDirectory, "XV2INS.exe");
 
         try
         {
+            if (!File.Exists(xv2insPath))
+            {
+                AppendLog($"Cannot run XV2INS: '{xv2insPath}' wasn't found - the previous install step may not have completed.", LogLevel.Error);
+                return false;
+            }
+
+            AppendLog("Launching XV2INS for the first time so it can initialize itself against this Modded folder - " +
+                      "please close it once it's done, and XenoSync Launcher will continue automatically.");
+
             using var process = Process.Start(new ProcessStartInfo(xv2insPath)
             {
                 UseShellExecute = true,
-                WorkingDirectory = _settings.ModdedPath
+                WorkingDirectory = runDirectory
             });
 
             if (process is null)
@@ -2406,6 +2447,26 @@ public partial class MainWindow : Window
         {
             AppendLog($"Failed to run XV2INS: {ex.Message}", LogLevel.Error);
             return false;
+        }
+        finally
+        {
+            // Always restore the original folder layout, whether XV2INS
+            // succeeded, failed, or was cancelled - never leave the
+            // Vanilla/Modded folders swapped.
+            if (swapState is not null)
+            {
+                try
+                {
+                    _directorySwapService.Restore(swapState);
+                    AppendLog("Restored the Vanilla and Modded folders to their original locations.");
+                }
+                catch (Exception ex)
+                {
+                    AppendLog($"Failed to restore the Vanilla/Modded folder swap after running XV2INS: {ex.Message}. " +
+                              "Check whether a folder is still sitting under the temporary name 'temporary_Xenoverse2' " +
+                              "alongside your Vanilla folder, and rename it back manually if so.", LogLevel.Error);
+                }
+            }
         }
     }
 
