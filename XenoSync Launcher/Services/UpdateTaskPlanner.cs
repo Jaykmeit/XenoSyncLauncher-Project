@@ -46,6 +46,22 @@ public class UpdateTaskPlanner
 
         bool forceReinstall = settings?.ForceReinstallOnNextUpdate == true;
 
+        // Order matters here on real dependency grounds, not just historical
+        // accident: XV2Patcher and XV2INS both need to be fully in place
+        // BEFORE Revamp installs, since Revamp's own installer/content
+        // assumes the patched game + XV2INS's .x2m tooling already exist.
+        // XV2Patcher -> XV2INS (with its own blocking first-launch step,
+        // see AddXv2InsPrerequisiteTasks) -> Revamp is the correct order.
+        //
+        // A previous version of this method swapped Revamp before the XV2INS
+        // block to work around the pipeline appearing to silently skip
+        // Revamp during a forced Repair. That turned out to be the wrong
+        // fix for the wrong cause: the real bug was Revamp Core's own stale
+        // "installed" marker never getting cleared before a repair (see
+        // MainWindow.ResetRevampInstallMarker), which made post-copy
+        // verification trivially pass even when nothing had actually been
+        // reinstalled. With that fixed at the source, there's no reason to
+        // deviate from the correct dependency order here.
         AddComponentTasks(plan, idPrefix: "xv2patcher", displayName: "XV2Patcher",
             targetVersion: comparison.LatestXv2PatcherVersion, isUpToDate: comparison.Xv2PatcherUpToDate && !forceReinstall);
 

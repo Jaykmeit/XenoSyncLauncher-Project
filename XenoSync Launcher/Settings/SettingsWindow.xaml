@@ -112,7 +112,16 @@
                     <Button x:Name="XV2PatcherFlagsButton" Content="XV2 Patcher Flags..." Width="180" HorizontalAlignment="Left"
                         Style="{StaticResource WizardButton}" Click="XV2PatcherFlagsButton_Click" Margin="0,0,0,16"/>
 
-                    <!-- TODO (next step): DInput/XInput swap checkbox and the "Repair" button. -->
+                    <TextBlock Text="Repair" Foreground="{StaticResource BrushTextPrimary}" FontSize="13" FontWeight="SemiBold" Margin="0,4,0,6"/>
+                    <TextBlock Foreground="{StaticResource BrushTextSecondary}" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,10">
+                    Forces XV2Patcher, Revamp, and every currently-enabled mod to be reinstalled the next time you click Update - useful if something looks broken or incomplete.
+                    </TextBlock>
+                    <Button x:Name="RepairButton" Content="Repair on next Update" Width="180" HorizontalAlignment="Left"
+                        Style="{StaticResource WizardButton}" Click="RepairButton_Click" Margin="0,0,0,6"/>
+                    <TextBlock x:Name="RepairStatusText" Foreground="{StaticResource BrushWarning}" FontSize="11" FontStyle="Italic"
+                        TextWrapping="Wrap" Margin="0,0,0,16" Visibility="Collapsed"/>
+
+                    <!-- TODO (next step): DInput/XInput swap checkbox. -->
                 </StackPanel>
             </ScrollViewer>
 

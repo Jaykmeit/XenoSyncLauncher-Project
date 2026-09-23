@@ -43,6 +43,7 @@ public partial class MainWindow : Window
     private readonly ArchiveExtractionService _archiveExtractionService = new();
     private readonly InstalledComponentVersionService _installedVersionService = new();
     private readonly ComponentDownloadService _componentDownloadService = new();
+    private readonly DirectorySwapService _directorySwapService = new();
 
     /// <summary>Where each component's downloaded file ended up, keyed by "xv2patcher"/"revamp". Reset each time Update starts.</summary>
     private readonly Dictionary<string, string> _componentDownloadedFiles = new();
@@ -97,6 +98,17 @@ public partial class MainWindow : Window
     // --- Update pipeline state ---
     private List<UpdateTaskItem> _updateTasks = new();
     private int _currentTaskIndex;
+
+    /// <summary>
+    /// True for the duration of an Update triggered by a forced Repair (set
+    /// in StartUpdate from the same ForceReinstallOnNextUpdate flag it
+    /// captures as wasForceReinstall). Passed through to
+    /// ModInstallService.InstallBatchAsync via EnsureMandatoryModsInstalledAsync
+    /// so repair-only steps (e.g. Lazybones' "Revamp Dynamic Hair Repairer",
+    /// which only makes sense to run over already-installed content) know to
+    /// actually run, instead of firing on every first-time install too.
+    /// </summary>
+    private bool _isRepairInProgress;
 
     /// <summary>
     /// Cancelling this is how "Pause" (and closing the app mid-update) works:
@@ -686,9 +698,19 @@ public partial class MainWindow : Window
         var pending = new List<ModRecord>();
         foreach (var record in _modRecordsById.Values)
         {
+            // Revamp Core is installed via the dedicated Revamp download/install
+            // pipeline (RunRevampDownloadTaskAsync/RunInstallTaskAsync in the
+            // Update pipeline), not through ModInstallService's DownloadUrls-based
+            // flow this method drives. Its ModRecord has no DownloadUrls at all,
+            // so if it's ever flagged NeedsUpdate (e.g. after a Repair, or its
+            // key file failing verification), including it here just produces a
+            // confusing "No download URL is configured for this mod" failure
+            // instead of the real reinstall it actually needs.
+            if (record.Category == ModCategory.RevampCore) continue;
+
             bool isXenoSyncCore = record.Category == ModCategory.XenoSyncCore;
             if (!isXenoSyncCore && !(record.IsEnabled && record.NeedsUpdate))
-                continue; // Optional/RevampCore mods only get touched here if they're both enabled and verified broken
+                continue; // Optional mods only get touched here if they're both enabled and verified broken
 
             bool alreadyInstalled = !string.IsNullOrWhiteSpace(record.RepositoryFolder) && record.InstalledRelativeFiles.Count > 0;
             if (isXenoSyncCore && alreadyInstalled && !record.NeedsUpdate)
@@ -704,7 +726,7 @@ public partial class MainWindow : Window
             : $"Installing {pending.Count} mods (grouping any .x2m ones into a single XV2INS pass where possible)...");
 
         var results = await _modInstallService.InstallBatchAsync(
-            pending, _settings.ModdedPath, downloadProgress: null, _settings.SpeedLimitMbps, msg => AppendLog(msg), CancellationToken.None);
+            pending, _settings.ModdedPath, downloadProgress: null, _settings.SpeedLimitMbps, msg => AppendLog(msg), CancellationToken.None, _isRepairInProgress);
 
         foreach (var record in pending)
         {
@@ -719,7 +741,7 @@ public partial class MainWindow : Window
                 : $"Failed to install {record.Title}: {error}", success ? LogLevel.Info : LogLevel.Error);
         }
 
-        _modCatalogService.Save(_modRecordsById.Values.ToList());
+        _modCatalogService.Save(_settings.ModdedPath, _modRecordsById.Values.ToList());
     }
 
     private async void ModEntry_PropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
@@ -804,7 +826,7 @@ public partial class MainWindow : Window
                 }
             }
 
-            _modCatalogService.Save(_modRecordsById.Values.ToList());
+            _modCatalogService.Save(_settings.ModdedPath, _modRecordsById.Values.ToList());
             RefreshRunButtonState();
         }
         catch (Exception ex)
@@ -1254,11 +1276,114 @@ public partial class MainWindow : Window
                 AppendLog($"Controller DLL switched to {(_settings.UseDInput ? "DInput" : "XInput")}.");
             }
 
-            if (_settings.ForceReinstallOnNextUpdate)
-                AppendLog("Repair requested: XV2Patcher and Revamp will be reinstalled on the next Update.");
+            // Only act the moment the flag transitions to true - re-saving
+            // Settings while a repair is already pending (but hasn't run an
+            // Update yet) shouldn't re-mark every mod NeedsUpdate again on
+            // every single Save.
+            bool repairJustRequested = _settings.ForceReinstallOnNextUpdate && previousSettings?.ForceReinstallOnNextUpdate != true;
+            if (repairJustRequested)
+            {
+                MarkAllEnabledModsForReinstall();
+                AppendLog("Repair requested: XV2Patcher, Revamp, and every currently-enabled mod will be reinstalled on the next Update.", LogLevel.Warning);
+            }
 
             RefreshAutoUpdateTimerState();
             _ = RunLaunchInspectAsync();
+        }
+    }
+
+    /// <summary>
+    /// Wipes every currently-enabled mod's actually-installed files (same
+    /// removal ModInstallService.Disable does, regardless of whether they
+    /// were originally placed as loose files, via a self-extracting .exe, or
+    /// via XV2INS/.x2m - InstalledRelativeFiles is tracked identically no
+    /// matter which install method wrote them) and marks it NeedsUpdate, so
+    /// the next Update's EnsureMandatoryModsInstalledAsync pass reinstalls
+    /// it truly from scratch instead of merging fresh files on top of
+    /// whatever the old install left behind. This matters most for .x2m
+    /// mods: re-running XV2INS on top of already-installed content can
+    /// conflict rather than cleanly overwrite, which is why a Repair needs
+    /// the old files gone first, not just re-copied over.
+    ///
+    /// Disable() also flips IsEnabled off, which would normally hide the mod
+    /// from EnsureMandatoryModsInstalledAsync's Optional-mod pending check
+    /// (it requires IsEnabled AND NeedsUpdate) - IsEnabled is restored to
+    /// true right after so the mod stays "on" (just pending reinstall)
+    /// instead of silently disappearing from what Repair is supposed to fix.
+    ///
+    /// Revamp Core is deliberately skipped here - it's excluded from
+    /// EnsureMandatoryModsInstalledAsync entirely (see that method) and is
+    /// instead reinstalled via LauncherSettings.ForceReinstallOnNextUpdate
+    /// (consumed by UpdateTaskPlanner), which the Repair button also sets.
+    /// Its own stale "installed" marker (along with every other mod's
+    /// leftovers under data/) is separately cleared by
+    /// ClearDataFolderExceptUi right before Update's tasks run.
+    /// </summary>
+    private void MarkAllEnabledModsForReinstall()
+    {
+        if (_settings?.ModdedPath is null) return;
+
+        foreach (var record in _modRecordsById.Values.Where(m => m.IsEnabled && m.Category != ModCategory.RevampCore).ToList())
+        {
+            _modInstallService.Disable(record, _settings.ModdedPath);
+            record.IsEnabled = true; // Disable() turns this off - Repair keeps it "on", just pending reinstall
+            record.NeedsUpdate = true;
+            SyncModEntryNeedsUpdate(record.Id, true);
+        }
+
+        _modCatalogService.Save(_settings.ModdedPath, _modRecordsById.Values.ToList());
+        RefreshRunButtonState();
+    }
+
+    /// <summary>
+    /// Deletes everything directly under "&lt;ModdedPath&gt;/data/" except the
+    /// "ui" subfolder, right before a forced Repair re-runs XV2Patcher/
+    /// XV2INS/Revamp's install tasks. Confirmed (by the maintainer) that
+    /// "ui" is the only folder present in a genuinely vanilla install's
+    /// data/ - everything else in there (chara, stage, skill, .x2s slot
+    /// files, etc.) is mod/patch content, so it needs to be gone before a
+    /// repair reinstalls it or stale files from a since-removed or
+    /// since-changed mod can linger indefinitely and conflict with (or
+    /// simply outlive) whatever the repair puts back.
+    ///
+    /// This also covers Revamp's own "installed" marker (the
+    /// "data/LB Mod Installer" folder IsRevampInstalledCorrectly checks
+    /// for) - superseding the narrower fix that used to delete just that one
+    /// folder - so RunInstallTaskAsync's post-copy verification for Revamp
+    /// is guaranteed to start from "not installed" rather than trusting a
+    /// stale marker left over from the previous install, and every mod's
+    /// on-disk content (not just what InstalledRelativeFiles happened to
+    /// track) is genuinely gone before the repair puts fresh copies back.
+    /// </summary>
+    private void ClearDataFolderExceptUi(string moddedPath)
+    {
+        var dataDir = Path.Combine(moddedPath, "data");
+        if (!Directory.Exists(dataDir)) return;
+
+        try
+        {
+            int deletedFiles = 0, deletedDirs = 0;
+
+            foreach (var file in Directory.GetFiles(dataDir, "*", SearchOption.TopDirectoryOnly))
+            {
+                try { File.Delete(file); deletedFiles++; }
+                catch (Exception ex) { AppendLog($"Repair: couldn't delete '{file}': {ex.Message}", LogLevel.Warning); }
+            }
+
+            foreach (var dir in Directory.GetDirectories(dataDir, "*", SearchOption.TopDirectoryOnly))
+            {
+                if (string.Equals(Path.GetFileName(dir), "ui", StringComparison.OrdinalIgnoreCase))
+                    continue; // preserved on purpose - see this method's remarks
+
+                try { Directory.Delete(dir, recursive: true); deletedDirs++; }
+                catch (Exception ex) { AppendLog($"Repair: couldn't delete '{dir}': {ex.Message}", LogLevel.Warning); }
+            }
+
+            AppendLog($"Repair: cleared '{dataDir}' (kept 'ui') - removed {deletedDirs} folder(s) and {deletedFiles} loose file(s) so everything reinstalls onto a clean slate.");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Repair: couldn't clear the data folder: {ex.Message}", LogLevel.Warning);
         }
     }
 
@@ -1276,11 +1401,25 @@ public partial class MainWindow : Window
 
         _updateTasks = _updateTaskPlanner.BuildPlan(_lastComparison, _settings);
 
+        bool wasForceReinstall = _settings?.ForceReinstallOnNextUpdate == true;
+        _isRepairInProgress = wasForceReinstall;
+
         if (_settings is { ForceReinstallOnNextUpdate: true })
         {
             _settings.ForceReinstallOnNextUpdate = false;
             _settingsService.Save(_settings);
         }
+
+        // See ClearDataFolderExceptUi's own remarks for the full reasoning:
+        // a forced Repair re-runs XV2Patcher/XV2INS/Revamp's install tasks
+        // (and, via _isRepairInProgress above, marks every enabled mod for
+        // reinstall too), but nothing else wipes the old content those
+        // reinstalls would otherwise just merge on top of - including the
+        // file that marks Revamp "installed" from the PREVIOUS run, which
+        // can make a repair silently no-op for Revamp specifically while
+        // everything else still reinstalls correctly.
+        if (wasForceReinstall && _settings?.ModdedPath is not null)
+            ClearDataFolderExceptUi(_settings.ModdedPath);
 
         if (_updateTasks.Count == 0)
         {
@@ -2219,6 +2358,19 @@ public partial class MainWindow : Window
     /// RunExtractOrLaunchTaskAsync), this waits for the person to close
     /// XV2INS's own window themselves - there's no known silent/no-UI flag
     /// to rely on instead, and guessing at one risks silently doing nothing.
+    ///
+    /// XV2INS itself doesn't look at the folder it's running from to find
+    /// Xenoverse 2 - it looks the install up on its own (via Steam), which
+    /// for a separate-directory install always resolves to the Vanilla
+    /// folder rather than the Modded one XV2INS.exe was actually placed in.
+    /// Since Vanilla isn't the downgraded build XV2INS expects, its
+    /// first-run initialization otherwise fails against it outright. For a
+    /// separate-directory install this briefly swaps the Modded folder into
+    /// the Vanilla folder's location for just this one run (via
+    /// DirectorySwapService), so XV2INS initializes against the right
+    /// content, then always swaps everything back - whether the run
+    /// succeeds, fails, or is cancelled. An Over-Vanilla install already has
+    /// VanillaPath == ModdedPath, so nothing needs swapping there.
     /// </summary>
     private async Task<bool> RunXv2InsFirstLaunchAsync(CancellationToken token)
     {
@@ -2228,22 +2380,49 @@ public partial class MainWindow : Window
             return false;
         }
 
-        var xv2insPath = Path.Combine(_settings.ModdedPath, "XV2INS.exe");
-        if (!File.Exists(xv2insPath))
+        bool isSeparateDirectoryInstall = !string.IsNullOrWhiteSpace(_settings.VanillaPath) &&
+            !string.Equals(_settings.VanillaPath, _settings.ModdedPath, StringComparison.OrdinalIgnoreCase);
+
+        DirectorySwapState? swapState = null;
+
+        if (isSeparateDirectoryInstall)
         {
-            AppendLog($"Cannot run XV2INS: '{xv2insPath}' wasn't found - the previous install step may not have completed.", LogLevel.Error);
-            return false;
+            try
+            {
+                swapState = _directorySwapService.Swap(_settings.VanillaPath!, _settings.ModdedPath);
+                if (swapState is not null)
+                    AppendLog("Temporarily swapping the Modded folder into the Vanilla folder's location " +
+                              "(Vanilla parked as 'temporary_Xenoverse2') so XV2INS initializes against the right content...");
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"Couldn't prepare the temporary Vanilla/Modded folder swap for XV2INS: {ex.Message}", LogLevel.Error);
+                return false;
+            }
         }
 
-        AppendLog("Launching XV2INS for the first time so it can initialize itself against this Modded folder - " +
-                  "please close it once it's done, and XenoSync Launcher will continue automatically.");
+        // While swapped, the Modded folder's actual content (XV2INS.exe
+        // included) is physically sitting at what used to be the Vanilla
+        // path - that's where XV2INS must be launched from/against so it
+        // finds itself in the location Steam reports.
+        var runDirectory = swapState is not null ? _settings.VanillaPath! : _settings.ModdedPath;
+        var xv2insPath = Path.Combine(runDirectory, "XV2INS.exe");
 
         try
         {
+            if (!File.Exists(xv2insPath))
+            {
+                AppendLog($"Cannot run XV2INS: '{xv2insPath}' wasn't found - the previous install step may not have completed.", LogLevel.Error);
+                return false;
+            }
+
+            AppendLog("Launching XV2INS for the first time so it can initialize itself against this Modded folder - " +
+                      "please close it once it's done, and XenoSync Launcher will continue automatically.");
+
             using var process = Process.Start(new ProcessStartInfo(xv2insPath)
             {
                 UseShellExecute = true,
-                WorkingDirectory = _settings.ModdedPath
+                WorkingDirectory = runDirectory
             });
 
             if (process is null)
@@ -2268,6 +2447,62 @@ public partial class MainWindow : Window
         {
             AppendLog($"Failed to run XV2INS: {ex.Message}", LogLevel.Error);
             return false;
+        }
+        finally
+        {
+            // Always restore the original folder layout, whether XV2INS
+            // succeeded, failed, or was cancelled - never leave the
+            // Vanilla/Modded folders swapped.
+            if (swapState is not null)
+            {
+                try
+                {
+                    _directorySwapService.Restore(swapState);
+                    AppendLog("Restored the Vanilla and Modded folders to their original locations.");
+                }
+                catch (Exception ex)
+                {
+                    AppendLog($"Failed to restore the Vanilla/Modded folder swap after running XV2INS: {ex.Message}. " +
+                              "Check whether a folder is still sitting under the temporary name 'temporary_Xenoverse2' " +
+                              "alongside your Vanilla folder, and rename it back manually if so.", LogLevel.Error);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Kills any running process matching processName (case-insensitive,
+    /// no ".exe" suffix), waiting briefly for it to fully exit. Used right
+    /// before overwriting an executable that might still be locked by a
+    /// previous run - most concretely XV2INS.exe/xv2characreat.exe, which
+    /// RunXv2InsFirstLaunchAsync and ModInstallService's X2M install paths
+    /// deliberately launch and wait on, but which can end up still holding
+    /// their own file handle open (or which the user may still have open
+    /// manually) by the time a Repair tries to overwrite them with a fresh
+    /// copy - producing a "being used by another process" IOException from
+    /// File.Copy. Best-effort: a process that can't be killed (already
+    /// exited, access denied) is silently skipped rather than failing the
+    /// whole install.
+    /// </summary>
+    private static void KillProcessIfRunning(string processName)
+    {
+        foreach (var process in Process.GetProcessesByName(processName))
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit(5000);
+            }
+            catch
+            {
+                // Already exited between GetProcessesByName and Kill, access
+                // denied, etc. - best effort, the retry loop in
+                // CopyFileWithRetry is the real safety net either way.
+            }
+            finally
+            {
+                process.Dispose();
+            }
         }
     }
 
@@ -2350,7 +2585,7 @@ public partial class MainWindow : Window
                     // before merging anything - IsRevampInstalledCorrectly
                     // below still verifies the result either way, regardless
                     // of which of these two paths actually placed the files.
-                    var installerExe = Directory.GetFiles(effectiveSourceDir, "*.exe", SearchOption.TopDirectoryOnly).FirstOrDefault();
+                    var installerExe = Directory.GetFiles(effectiveSourceDir, "*.exe", SearchOption.AllDirectories).FirstOrDefault();
                     if (installerExe is not null)
                     {
                         AppendLog($"Running Revamp's installer: {Path.GetFileName(installerExe)}... " +
@@ -2363,6 +2598,25 @@ public partial class MainWindow : Window
                             return false;
                         }
                     }
+                    else
+                    {
+                        AppendLog("Couldn't find an .exe installer anywhere inside Revamp's extracted archive - " +
+                                  "merging its extracted files directly instead. If Revamp still isn't showing as " +
+                                  "installed afterwards, its archive layout may have changed.", LogLevel.Warning);
+                    }
+                }
+
+                if (componentKey == "xv2ins")
+                {
+                    // A previous XV2INS run (RunXv2InsFirstLaunchAsync from an
+                    // earlier Update, XV2INS launched to install a .x2m mod,
+                    // or the user simply having it open) may still be holding
+                    // xv2ins.exe/xv2characreat.exe open when a Repair tries to
+                    // overwrite them here - producing a "being used by
+                    // another process" IOException. Kill any running copy
+                    // first so the overwrite below can actually succeed.
+                    KillProcessIfRunning("xv2ins");
+                    KillProcessIfRunning("xv2characreat");
                 }
 
                 // xv2ins-dcd's files specifically belong under data/ (that's
@@ -2529,7 +2783,33 @@ public partial class MainWindow : Window
             var relative = Path.GetRelativePath(sourceDir, file);
             var destination = Path.Combine(targetDir, relative);
             Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-            File.Copy(file, destination, overwrite: true);
+            CopyFileWithRetry(file, destination);
+        }
+    }
+
+    /// <summary>
+    /// File.Copy with a short retry loop for transient "being used by another
+    /// process" IOExceptions - e.g. overwriting xv2ins.exe during a Repair
+    /// when a previous XV2INS run hasn't fully released its file handle yet
+    /// even after KillProcessIfRunning, or antivirus is still scanning a
+    /// just-extracted file. Mirrors the same retry pattern LaunchAndWaitAsync
+    /// already uses for the analogous "file locked right after extraction"
+    /// case, just synchronous since MergeDirectory already runs on a
+    /// background thread via Task.Run.
+    /// </summary>
+    private static void CopyFileWithRetry(string sourcePath, string destinationPath, int maxAttempts = 5)
+    {
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                File.Copy(sourcePath, destinationPath, overwrite: true);
+                return;
+            }
+            catch (IOException) when (attempt < maxAttempts)
+            {
+                Thread.Sleep(500 * attempt);
+            }
         }
     }
 
@@ -2740,22 +3020,39 @@ public partial class MainWindow : Window
         return total;
     }
 
+    /// <summary>
+    /// Runs right after the XV2Patcher/Revamp/XV2INS component pipeline
+    /// finishes. _activityState is deliberately kept at Updating (and
+    /// Update/Run stay hidden) all the way through
+    /// EnsureMandatoryModsInstalledAsync below, not just while this method's
+    /// own progress panels are visible - that step can itself take a long
+    /// time (resolving a MediaFire link, a slow download, extracting a large
+    /// archive, or an installer the user has to click through), and setting
+    /// _activityState = Idle before it's done leaves a real window where a
+    /// second Update click (or the 30-minute Auto-Update timer) slips past
+    /// StartUpdate's "already updating" guard and fires a SECOND, overlapping
+    /// EnsureMandatoryModsInstalledAsync call - racing over the exact same
+    /// deterministic %TEMP% extraction paths as the one already running. This
+    /// is exactly what produced a mod that stayed stuck on "Extracting..."
+    /// indefinitely after Update was clicked a second time while the first
+    /// mod-install pass was still resolving/downloading/extracting.
+    /// </summary>
     private async Task FinishUpdateAsync()
     {
-        _activityState = LauncherActivityState.Idle;
-
         UpdateStatusPanel.Visibility = Visibility.Collapsed;
         UpdateProgressBar.Visibility = Visibility.Collapsed;
         UpdateBytesText.Visibility = Visibility.Collapsed;
         GameDownloadStatusPanel.Visibility = Visibility.Collapsed;
         PauseResumeButton.Visibility = Visibility.Collapsed;
-        UpdateButton.Visibility = Visibility.Visible;
-        RunButton.Visibility = Visibility.Visible;
 
-        AppendLog("Update finished.");
+        AppendLog("Update finished. Checking mods...");
         await LoadModsAsync();
         await EnsureMandatoryModsInstalledAsync();
         await RunLaunchInspectAsync();
+
+        _activityState = LauncherActivityState.Idle;
+        UpdateButton.Visibility = Visibility.Visible;
+        RunButton.Visibility = Visibility.Visible;
     }
 
     private void RunButton_Click(object sender, RoutedEventArgs e)
