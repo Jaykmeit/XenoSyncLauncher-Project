@@ -44,6 +44,7 @@ public partial class MainWindow : Window
     private readonly InstalledComponentVersionService _installedVersionService = new();
     private readonly ComponentDownloadService _componentDownloadService = new();
     private readonly DirectorySwapService _directorySwapService = new();
+    private readonly InstallVerificationService _installVerificationService = new();
 
     /// <summary>Where each component's downloaded file ended up, keyed by "xv2patcher"/"revamp". Reset each time Update starts.</summary>
     private readonly Dictionary<string, string> _componentDownloadedFiles = new();
@@ -2209,6 +2210,8 @@ public partial class MainWindow : Window
         if (process is null)
             return (false, "the process could not be started.");
 
+        int exitCode;
+
         try
         {
             using (process)
@@ -2221,12 +2224,26 @@ public partial class MainWindow : Window
                 await process.WaitForExitAsync(CancellationToken.None);
 
                 if (token.IsCancellationRequested) return (false, "Cancelled");
+
+                exitCode = process.ExitCode;
             }
         }
         catch (Exception ex)
         {
             return (false, ex.Message);
         }
+
+        // A non-zero exit code usually means the installer hit an error or
+        // was cancelled by the user before it finished doing its job -
+        // treat it as a failure here so the caller stops the Update instead
+        // of trusting a window that merely closed. Some installers can
+        // legitimately return non-zero on a normal close, but for the two
+        // installers this codepath actually launches (Revamp's own
+        // installer, and any generic installer XenoSync detects instead of
+        // a plain archive), erring toward catching real failures is safer
+        // than silently treating "closed" as "succeeded".
+        if (exitCode != 0)
+            return (false, $"the installer closed with a non-zero exit code ({exitCode}), which usually means it hit an error or was cancelled before finishing.");
 
         return (true, null);
     }
@@ -2419,26 +2436,19 @@ public partial class MainWindow : Window
             AppendLog("Launching XV2INS for the first time so it can initialize itself against this Modded folder - " +
                       "please close it once it's done, and XenoSync Launcher will continue automatically.");
 
-            using var process = Process.Start(new ProcessStartInfo(xv2insPath)
+            // LaunchAndWaitAsync (shared with the Revamp installer launches
+            // below) gives this the same antivirus-lock retry loop AND the
+            // same non-zero-exit-code failure check: XV2INS (a.k.a. "LB
+            // Installer") closing with an error instead of completing its
+            // first-time setup must stop the Update, not be silently
+            // treated as success just because the window closed.
+            var (launched, launchError) = await LaunchAndWaitAsync(xv2insPath, runDirectory, token);
+            if (!launched)
             {
-                UseShellExecute = true,
-                WorkingDirectory = runDirectory
-            });
-
-            if (process is null)
-            {
-                AppendLog("Failed to launch XV2INS.");
+                if (launchError == "Cancelled") return false;
+                AppendLog($"XV2INS (LB Installer) closed without completing its first-time setup: {launchError}", LogLevel.Error);
                 return false;
             }
-
-            await using var registration = token.Register(() =>
-            {
-                try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { /* ignore */ }
-            });
-
-            await process.WaitForExitAsync(CancellationToken.None);
-
-            if (token.IsCancellationRequested) return false;
 
             AppendLog("XV2INS closed.");
             return true;
@@ -2530,6 +2540,16 @@ public partial class MainWindow : Window
             {
                 AppendLog("Revamp's installer closed, but its key file (data/LB Mod Installer/revamp xenoverse 2 project_revamp team.xml) " +
                           "wasn't found afterwards. Treating this as a failed install.", LogLevel.Error);
+                return false;
+            }
+
+            // xv2ins-reg writes directly to the registry rather than
+            // producing a file - actively re-read it back to confirm the
+            // association actually took effect, rather than trusting that
+            // RegisterAssociation not throwing means it worked.
+            if (componentKey == "xv2ins-reg" && !X2mRegistryAssociationService.IsX2mAssociated(_settings.ModdedPath))
+            {
+                AppendLog("The .x2m file association wasn't found registered for this Modded folder after registering it - the install did not complete correctly.", LogLevel.Error);
                 return false;
             }
 
@@ -2628,8 +2648,15 @@ public partial class MainWindow : Window
                 await Task.Run(() => MergeDirectory(effectiveSourceDir, targetDir), token);
             }
 
-            if (componentKey == "xv2patcher" && !File.Exists(Xv2PatcherIniPath(_settings.ModdedPath)))
-                AppendLog($"xv2patcher.ini still isn't at '{Xv2PatcherIniPath(_settings.ModdedPath)}' after installing - see the staging folder listing above.", LogLevel.Error);
+            if (componentKey == "xv2patcher")
+            {
+                var (patcherVerified, patcherVerifyError) = _installVerificationService.Verify(componentKey, _settings.ModdedPath);
+                if (!patcherVerified)
+                {
+                    AppendLog($"{patcherVerifyError} See the staging folder listing above.", LogLevel.Error);
+                    return false;
+                }
+            }
 
             if (componentKey == "revamp" && !IsRevampInstalledCorrectly(_settings.ModdedPath))
             {
@@ -2668,6 +2695,21 @@ public partial class MainWindow : Window
                 }
 
                 AppendLog("Revamp's key file was found after running the fallback installer.");
+            }
+
+            // xv2patcher and revamp already have their own richer,
+            // purpose-built checks above (with fallback installer searches,
+            // in Revamp's case) - this covers every other component that
+            // just has a plain marker file/directory to actively confirm
+            // (currently xv2ins and xv2ins-dcd - see InstallVerificationService).
+            if (componentKey is not ("xv2patcher" or "revamp"))
+            {
+                var (verified, verifyError) = _installVerificationService.Verify(componentKey, _settings.ModdedPath);
+                if (!verified)
+                {
+                    AppendLog(verifyError!, LogLevel.Error);
+                    return false;
+                }
             }
 
             RecordInstalledVersion(componentKey);
