@@ -330,7 +330,6 @@ public class ModInstallService
         onStatus?.Invoke($"Installing {allX2mFiles.Count} .x2m file(s) across {group.Count} mod(s) in one XV2INS pass...");
 
         var arguments = string.Join(' ', allX2mFiles.Select(f => $"\"{f}\""));
-        int xv2insExitCode;
         using (var process = Process.Start(new ProcessStartInfo(xv2insPath, arguments) { UseShellExecute = true, WorkingDirectory = moddedPath }))
         {
             if (process is null)
@@ -340,19 +339,14 @@ public class ModInstallService
                 return results;
             }
             await process.WaitForExitAsync(token);
-            xv2insExitCode = process.ExitCode;
-        }
 
-        // A non-zero exit code means XV2INS ("LB Installer") itself reported
-        // an error or was cancelled rather than completing normally - fail
-        // the whole batch outright instead of relying only on the
-        // no-new-files check below, which a partial/aborted run could still
-        // slip past if it managed to write something before erroring out.
-        if (xv2insExitCode != 0)
-        {
-            var error = $"XV2INS (LB Installer) closed with a non-zero exit code ({xv2insExitCode}) while installing this batch - it likely hit an error or was cancelled before finishing.";
-            foreach (var (mod, _, _) in group) results[mod.Id] = (false, error);
-            return results;
+            // XV2INS's exit code is deliberately not treated as a
+            // success/failure signal here - it's an older Windows installer
+            // that doesn't reliably return 0 even on a completely normal
+            // close, and trusting it produced false failures for batches
+            // that had actually installed correctly. The newFiles check
+            // below (did anything actually get written?) is the real,
+            // reliable signal for whether this batch succeeded.
         }
 
         // Companion .exe(s) per-mod, run after the shared XV2INS pass. See
@@ -576,19 +570,14 @@ public class ModInstallService
         var beforeStep2 = SnapshotRelativeFiles(moddedPath); // taken after step 1's cleanup, so deleted files don't get re-counted
         onStatus?.Invoke($"Installing {string.Join(", ", x2mFiles.Select(Path.GetFileName))}...");
         var arguments = string.Join(' ', x2mFiles.Select(f => $"\"{f}\""));
-        int xv2insExitCode;
         using (var xv2insProcess = Process.Start(new ProcessStartInfo(xv2insPath, arguments) { UseShellExecute = true, WorkingDirectory = moddedPath }))
         {
             if (xv2insProcess is null) return (false, $"Couldn't start XV2INS for {mod.Title}.");
             await xv2insProcess.WaitForExitAsync(token);
-            xv2insExitCode = xv2insProcess.ExitCode;
+            // XV2INS's exit code isn't a reliable success/failure signal -
+            // see InstallX2mGroupAsync's equivalent remark. The newFiles
+            // check below is what actually confirms this step's result.
         }
-
-        // See InstallX2mGroupAsync's equivalent check: a non-zero exit code
-        // means XV2INS ("LB Installer") itself reported an error or was
-        // cancelled, rather than completing normally.
-        if (xv2insExitCode != 0)
-            return (false, $"XV2INS (LB Installer) closed with a non-zero exit code ({xv2insExitCode}) while installing the 'Install Second' step of {mod.Title} - it likely hit an error or was cancelled before finishing.");
 
         var step2Files = await SnapshotDiffWithRetryAsync(moddedPath, beforeStep2);
 
@@ -883,7 +872,6 @@ public class ModInstallService
             : $"Installing {Path.GetFileName(x2mFiles[0])}...");
 
         var arguments = string.Join(' ', x2mFiles.Select(f => $"\"{f}\""));
-        int xv2insExitCode;
         using (var process = Process.Start(new ProcessStartInfo(xv2insPath, arguments)
         {
             UseShellExecute = true,
@@ -892,15 +880,10 @@ public class ModInstallService
         {
             if (process is null) return (false, $"Couldn't start XV2INS for {mod.Title}.");
             await process.WaitForExitAsync(token);
-            xv2insExitCode = process.ExitCode;
+            // XV2INS's exit code isn't a reliable success/failure signal -
+            // see InstallX2mGroupAsync's equivalent remark. The newFiles
+            // check below is what actually confirms this install's result.
         }
-
-        // A non-zero exit code means XV2INS ("LB Installer") itself
-        // reported an error or was cancelled, rather than completing
-        // normally - fail outright instead of relying only on the
-        // no-new-files check below.
-        if (xv2insExitCode != 0)
-            return (false, $"XV2INS (LB Installer) closed with a non-zero exit code ({xv2insExitCode}) while installing {mod.Title} - it likely hit an error or was cancelled before finishing.");
 
         if (isRepair || IsSparkingPack(mod))
         {
