@@ -43,7 +43,7 @@ public partial class MainWindow : Window
     private readonly ArchiveExtractionService _archiveExtractionService = new();
     private readonly InstalledComponentVersionService _installedVersionService = new();
     private readonly ComponentDownloadService _componentDownloadService = new();
-    private readonly DirectorySwapService _directorySwapService = new();
+    private readonly Xv2InsConfigService _xv2InsConfigService = new();
     private readonly InstallVerificationService _installVerificationService = new();
 
     /// <summary>Where each component's downloaded file ended up, keyed by "xv2patcher"/"revamp". Reset each time Update starts.</summary>
@@ -1285,6 +1285,30 @@ public partial class MainWindow : Window
             if (repairJustRequested)
             {
                 MarkAllEnabledModsForReinstall();
+
+                // XV2INS keeps its own "which game folder am I working
+                // against" setting in %AppData%/XV2INS/xv2ins.ini
+                // ([General] game_directory) - completely independent of
+                // where its .exe sits or what Steam reports. If that value
+                // is empty, or was ever set to the Vanilla folder instead of
+                // this Modded one (both confirmed to happen - see
+                // RunXv2InsFirstLaunchAsync's remarks), XV2INS keeps
+                // operating against the wrong place. Point it at the current
+                // Modded folder right away on Repair, not just right before
+                // the Update's own XV2INS first-launch task runs.
+                if (_settings.ModdedPath is not null)
+                {
+                    try
+                    {
+                        _xv2InsConfigService.SetGameDirectory(_settings.ModdedPath);
+                        AppendLog("Pointed XV2INS's own config (xv2ins.ini) at this Modded folder.");
+                    }
+                    catch (Exception ex)
+                    {
+                        AppendLog($"Couldn't update XV2INS's config (xv2ins.ini): {ex.Message}", LogLevel.Warning);
+                    }
+                }
+
                 AppendLog("Repair requested: XV2Patcher, Revamp, and every currently-enabled mod will be reinstalled on the next Update.", LogLevel.Warning);
             }
 
@@ -2210,8 +2234,6 @@ public partial class MainWindow : Window
         if (process is null)
             return (false, "the process could not be started.");
 
-        int exitCode;
-
         try
         {
             using (process)
@@ -2225,25 +2247,24 @@ public partial class MainWindow : Window
 
                 if (token.IsCancellationRequested) return (false, "Cancelled");
 
-                exitCode = process.ExitCode;
+                // The exit code is deliberately NOT treated as a
+                // success/failure signal: XV2INS and other older Windows
+                // installers launched through this path don't reliably
+                // return 0 even on a completely normal, successful close -
+                // trusting it here produced false failures for installs
+                // that had actually succeeded. Just log it for visibility;
+                // the caller confirms real success/failure by checking for
+                // the specific file(s) the install was supposed to produce
+                // instead (see InstallVerificationService and the "no new
+                // files showed up" checks in ModInstallService).
+                if (process.ExitCode != 0)
+                    AppendLog($"'{Path.GetFileName(exePath)}' closed with exit code {process.ExitCode} - not necessarily an error, many installers don't return 0 on success. Verifying the actual install result instead.", LogLevel.Warning);
             }
         }
         catch (Exception ex)
         {
             return (false, ex.Message);
         }
-
-        // A non-zero exit code usually means the installer hit an error or
-        // was cancelled by the user before it finished doing its job -
-        // treat it as a failure here so the caller stops the Update instead
-        // of trusting a window that merely closed. Some installers can
-        // legitimately return non-zero on a normal close, but for the two
-        // installers this codepath actually launches (Revamp's own
-        // installer, and any generic installer XenoSync detects instead of
-        // a plain archive), erring toward catching real failures is safer
-        // than silently treating "closed" as "succeeded".
-        if (exitCode != 0)
-            return (false, $"the installer closed with a non-zero exit code ({exitCode}), which usually means it hit an error or was cancelled before finishing.");
 
         return (true, null);
     }
@@ -2376,18 +2397,18 @@ public partial class MainWindow : Window
     /// XV2INS's own window themselves - there's no known silent/no-UI flag
     /// to rely on instead, and guessing at one risks silently doing nothing.
     ///
-    /// XV2INS itself doesn't look at the folder it's running from to find
-    /// Xenoverse 2 - it looks the install up on its own (via Steam), which
-    /// for a separate-directory install always resolves to the Vanilla
-    /// folder rather than the Modded one XV2INS.exe was actually placed in.
-    /// Since Vanilla isn't the downgraded build XV2INS expects, its
-    /// first-run initialization otherwise fails against it outright. For a
-    /// separate-directory install this briefly swaps the Modded folder into
-    /// the Vanilla folder's location for just this one run (via
-    /// DirectorySwapService), so XV2INS initializes against the right
-    /// content, then always swaps everything back - whether the run
-    /// succeeds, fails, or is cancelled. An Over-Vanilla install already has
-    /// VanillaPath == ModdedPath, so nothing needs swapping there.
+    /// XV2INS's actual first-run problem was NOT about which folder it's
+    /// running from or what Steam reports - it's about its own persisted
+    /// config at "%AppData%/XV2INS/xv2ins.ini", which has a
+    /// "[General] game_directory" value XV2INS reads to know where to work.
+    /// If that value is empty, or was ever set to the Vanilla folder instead
+    /// of the Modded one, XV2INS operates against the wrong (or no) game
+    /// folder regardless of where its own .exe sits. So right before every
+    /// launch, this writes that value to the current Modded path via
+    /// Xv2InsConfigService - which is the actual, minimal fix (a previous
+    /// approach here briefly swapped the Vanilla/Modded folders on disk
+    /// around the launch instead; that never addressed the real cause and
+    /// has been removed).
     /// </summary>
     private async Task<bool> RunXv2InsFirstLaunchAsync(CancellationToken token)
     {
@@ -2397,87 +2418,37 @@ public partial class MainWindow : Window
             return false;
         }
 
-        bool isSeparateDirectoryInstall = !string.IsNullOrWhiteSpace(_settings.VanillaPath) &&
-            !string.Equals(_settings.VanillaPath, _settings.ModdedPath, StringComparison.OrdinalIgnoreCase);
-
-        DirectorySwapState? swapState = null;
-
-        if (isSeparateDirectoryInstall)
+        var xv2insPath = Path.Combine(_settings.ModdedPath, "XV2INS.exe");
+        if (!File.Exists(xv2insPath))
         {
-            try
-            {
-                swapState = _directorySwapService.Swap(_settings.VanillaPath!, _settings.ModdedPath);
-                if (swapState is not null)
-                    AppendLog("Temporarily swapping the Modded folder into the Vanilla folder's location " +
-                              "(Vanilla parked as 'temporary_Xenoverse2') so XV2INS initializes against the right content...");
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"Couldn't prepare the temporary Vanilla/Modded folder swap for XV2INS: {ex.Message}", LogLevel.Error);
-                return false;
-            }
+            AppendLog($"Cannot run XV2INS: '{xv2insPath}' wasn't found - the previous install step may not have completed.", LogLevel.Error);
+            return false;
         }
-
-        // While swapped, the Modded folder's actual content (XV2INS.exe
-        // included) is physically sitting at what used to be the Vanilla
-        // path - that's where XV2INS must be launched from/against so it
-        // finds itself in the location Steam reports.
-        var runDirectory = swapState is not null ? _settings.VanillaPath! : _settings.ModdedPath;
-        var xv2insPath = Path.Combine(runDirectory, "XV2INS.exe");
 
         try
         {
-            if (!File.Exists(xv2insPath))
-            {
-                AppendLog($"Cannot run XV2INS: '{xv2insPath}' wasn't found - the previous install step may not have completed.", LogLevel.Error);
-                return false;
-            }
-
-            AppendLog("Launching XV2INS for the first time so it can initialize itself against this Modded folder - " +
-                      "please close it once it's done, and XenoSync Launcher will continue automatically.");
-
-            // LaunchAndWaitAsync (shared with the Revamp installer launches
-            // below) gives this the same antivirus-lock retry loop AND the
-            // same non-zero-exit-code failure check: XV2INS (a.k.a. "LB
-            // Installer") closing with an error instead of completing its
-            // first-time setup must stop the Update, not be silently
-            // treated as success just because the window closed.
-            var (launched, launchError) = await LaunchAndWaitAsync(xv2insPath, runDirectory, token);
-            if (!launched)
-            {
-                if (launchError == "Cancelled") return false;
-                AppendLog($"XV2INS (LB Installer) closed without completing its first-time setup: {launchError}", LogLevel.Error);
-                return false;
-            }
-
-            AppendLog("XV2INS closed.");
-            return true;
+            _xv2InsConfigService.SetGameDirectory(_settings.ModdedPath);
+            AppendLog("Pointed XV2INS's own config (xv2ins.ini) at this Modded folder before launching it.");
         }
         catch (Exception ex)
         {
-            AppendLog($"Failed to run XV2INS: {ex.Message}", LogLevel.Error);
+            AppendLog($"Couldn't update XV2INS's config (xv2ins.ini) with the Modded folder: {ex.Message}. Continuing anyway - " +
+                      "XV2INS may still prompt about the wrong game directory.", LogLevel.Warning);
+        }
+
+        AppendLog("Launching XV2INS for the first time so it can initialize itself against this Modded folder - " +
+                  "please close it once it's done, and XenoSync Launcher will continue automatically.");
+
+        var (launched, launchError) = await LaunchAndWaitAsync(xv2insPath, _settings.ModdedPath, token);
+        if (!launched)
+        {
+            if (launchError == "Cancelled") return false;
+            AppendLog($"XV2INS closed without completing its first-time setup: {launchError}", LogLevel.Error);
             return false;
         }
-        finally
-        {
-            // Always restore the original folder layout, whether XV2INS
-            // succeeded, failed, or was cancelled - never leave the
-            // Vanilla/Modded folders swapped.
-            if (swapState is not null)
-            {
-                try
-                {
-                    _directorySwapService.Restore(swapState);
-                    AppendLog("Restored the Vanilla and Modded folders to their original locations.");
-                }
-                catch (Exception ex)
-                {
-                    AppendLog($"Failed to restore the Vanilla/Modded folder swap after running XV2INS: {ex.Message}. " +
-                              "Check whether a folder is still sitting under the temporary name 'temporary_Xenoverse2' " +
-                              "alongside your Vanilla folder, and rename it back manually if so.", LogLevel.Error);
-                }
-            }
-        }
+
+        AppendLog("XV2INS closed.");
+        return true;
     }
 
     /// <summary>
